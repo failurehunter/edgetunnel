@@ -2086,6 +2086,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const ctx代理参数 = 反代上下文.代理参数 || {};
 	const ctx反代兜底 = 反代上下文.反代兜底 !== undefined ? 反代上下文.反代兜底 : true;
 	let 反代数组索引 = 0;
+	let 选定反代 = null;
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
@@ -2206,7 +2207,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectDirect(address, port, data = null, 启用预加载 = false) {
 		const 预加载候选列表 = 启用预加载 ? await 构建预加载竞速候选列表(address, port) : null;
-		const 候选列表 = 预加载候选列表 || Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
+		const 候选列表 = 预加载候选列表 || [{ hostname: address, port, attempt: 0 }];
 		log(预加载候选列表
 			? `[TCP直连] 并发尝试 ${候选列表.length} 路: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`
 			: `[TCP直连] 并发尝试 ${候选列表.length} 路: ${address}:${port}`);
@@ -2228,6 +2229,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = true) {
+		if (选定反代) {
+			const [反代地址, 反代端口] = 选定反代;
+			log(`[反代连接] 复用会话反代: ${反代地址}:${反代端口}`);
+			let socket = null;
+			try {
+				socket = await 打开TCP连接(反代地址, 反代端口);
+				await 写入首包(socket, data);
+				return socket;
+			} catch (err) {
+				try { socket?.close?.() } catch (e) { }
+				log(`[反代连接] 复用反代失败: ${err.message || err}，回退反代池`);
+			}
+		}
 		if (所有反代数组 && 所有反代数组.length > 0) {
 			const 实际并发数 = Math.max(1, Math.floor(Number(反代并发拨号数) || 1));
 			for (let i = 0; i < 所有反代数组.length; i += 实际并发数) {
@@ -2246,6 +2260,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					await 写入首包(socket, data);
 					log(`[反代连接] 成功连接到: ${candidate.hostname}:${candidate.port} (索引: ${candidate.index})`);
 					反代数组索引 = candidate.index;
+					选定反代 = [candidate.hostname, candidate.port];
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
@@ -2261,6 +2276,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connecttoPry(允许发送首包 = true) {
+		if (remoteConnWrapper.downlink已开始) {
+			log(`[TCP下行] 会话中断-已丢弃重连 (${host}:${portNum})`);
+			closeSocketQuietly(ws);
+			throw new Error('downlink已开始，丢弃重连');
+		}
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
 			return;
@@ -2878,6 +2898,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 				} else {
 					await 下行发送器.发送(value);
 				}
+				if (!remoteConnWrapper?.downlink已开始) remoteConnWrapper.downlink已开始 = true;
 			}
 		} else {
 			let readBuffer = new ArrayBuffer(BYOB单次读取上限);
@@ -2895,6 +2916,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 					await 下行发送器.发送(value.slice());
 					readBuffer = value.buffer.byteLength >= BYOB单次读取上限 ? value.buffer : new ArrayBuffer(BYOB单次读取上限);
 				}
+				if (!remoteConnWrapper?.downlink已开始) remoteConnWrapper.downlink已开始 = true;
 			}
 		}
 		if (当前连接仍有效()) await 下行发送器.flush();
@@ -2961,28 +2983,76 @@ function 构造WS本地204响应(respHeader = null) {
 ///////////////////////////////////////////////////////SOCKS5/HTTP函数///////////////////////////////////////////////
 async function socks5Connect(targetHost, targetPort, initialData, TCP连接, parsedSocks5) {
 	const { username, password, hostname, port } = parsedSocks5 || {};
-	const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
+	const socket = TCP连接({ hostname, port });
+	try {
+		await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'SOCKS5 连接超时');
+	} catch (error) {
+		try { socket.close() } catch (e) { }
+		throw error;
+	}
+	const writer = socket.writable.getWriter(), reader = socket.readable.getReader();
+	const 读取精确字节 = async (需要字节数, 错误信息) => {
+		let 累积 = new Uint8Array(0);
+		while (累积.byteLength < 需要字节数) {
+			const { done, value } = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 错误信息);
+			if (done || !value) throw new Error(错误信息);
+			累积 = 拼接字节数据(累积, value);
+		}
+		return 累积;
+	};
 	try {
 		const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
-		await writer.write(authMethods);
-		let response = await reader.read();
-		if (response.done || response.value.byteLength < 2) throw new Error('S5 method selection failed');
+		await withTimeout(writer.write(authMethods), CONNECT_TIMEOUT_MS, 'S5 method selection failed');
 
-		const selectedMethod = new Uint8Array(response.value)[1];
+		const 方法回复 = await 读取精确字节(2, 'S5 method selection failed');
+		const selectedMethod = 方法回复[1];
 		if (selectedMethod === 0x02) {
 			if (!username || !password) throw new Error('S5 requires authentication');
 			const userBytes = new TextEncoder().encode(username), passBytes = new TextEncoder().encode(password);
 			const authPacket = new Uint8Array([0x01, userBytes.length, ...userBytes, passBytes.length, ...passBytes]);
-			await writer.write(authPacket);
-			response = await reader.read();
-			if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 authentication failed');
+			await withTimeout(writer.write(authPacket), CONNECT_TIMEOUT_MS, 'S5 authentication failed');
+			const 认证回复 = await 读取精确字节(2, 'S5 authentication failed');
+			if (认证回复[1] !== 0x00) throw new Error('S5 authentication failed');
 		} else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
 
 		const hostBytes = new TextEncoder().encode(targetHost);
 		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
-		await writer.write(connectPacket);
-		response = await reader.read();
-		if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 connection failed');
+		await withTimeout(writer.write(connectPacket), CONNECT_TIMEOUT_MS, 'S5 connection failed');
+
+		// 解析并消费完整 connect-reply（BND.ADDR 长度不定），多余字节回灌为隧道数据
+		const 计算回复总长 = (buf) => {
+			if (buf.byteLength < 4) return 2;
+			const 回复类型 = buf[3];
+			if (回复类型 === 1) return 8;
+			if (回复类型 === 4) return 20;
+			if (回复类型 === 3) return buf.byteLength >= 5 ? 5 + buf[4] : 5;
+			return 8;
+		};
+		let 回复累积 = new Uint8Array(0);
+		let 回复总长 = 2;
+		while (回复累积.byteLength < 回复总长) {
+			const { done, value } = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'S5 connection failed');
+			if (done || !value) throw new Error('S5 connection failed');
+			回复累积 = 拼接字节数据(回复累积, value);
+			回复总长 = 计算回复总长(回复累积);
+		}
+		if (回复累积[1] !== 0x00) throw new Error('S5 connection failed');
+
+		if (回复累积.byteLength > 回复总长) {
+			const 多余数据 = 回复累积.subarray(回复总长);
+			writer.releaseLock(); reader.releaseLock();
+			const { readable, writable } = new TransformStream();
+			const transformWriter = writable.getWriter();
+			await transformWriter.write(多余数据);
+			transformWriter.releaseLock();
+			socket.readable.pipeTo(writable).catch(() => { });
+			if (有效数据长度(initialData) > 0) {
+				const 远端写入器 = socket.writable.getWriter();
+				await 远端写入器.write(initialData);
+				远端写入器.releaseLock();
+			}
+			return { readable, writable: socket.writable, closed: socket.closed, close: () => socket.close() };
+		}
 
 		if (有效数据长度(initialData) > 0) await writer.write(initialData);
 		writer.releaseLock(); reader.releaseLock();
@@ -3004,7 +3074,7 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	try {
-		if (HTTPS代理) await socket.opened;
+		if (HTTPS代理) await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'HTTPS 代理连接超时');
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
 		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
@@ -3013,9 +3083,9 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 
 		let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
 		while (headerEndIndex === -1 && bytesRead < 8192) {
-			const { done, value } = await reader.read();
+			const { done, value } = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, '代理 CONNECT 响应超时');
 			if (done || !value) throw new Error(`${HTTPS代理 ? 'HTTPS' : 'HTTP'} 代理在返回 CONNECT 响应前关闭连接`);
-			responseBuffer = new Uint8Array([...responseBuffer, ...value]);
+			responseBuffer = 拼接字节数据(responseBuffer, value);
 			bytesRead = responseBuffer.length;
 			const crlfcrlf = responseBuffer.findIndex((_, i) => i < responseBuffer.length - 3 && responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a && responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a);
 			if (crlfcrlf !== -1) headerEndIndex = crlfcrlf + 4;
@@ -3053,17 +3123,18 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	}
 }
 
+const HTTPS代理ChaCha缓存 = new Map();
 async function httpsConnect(targetHost, targetPort, initialData, TCP连接, parsedSocks5) {
 	const { username, password, hostname, port } = parsedSocks5 || {};
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	let tlsSocket = null;
 	const tlsServerName = isIPHostname(hostname) ? '' : stripIPv6Brackets(hostname);
-	const 打开HTTPS代理TLS = async (allowChacha = false) => {
+	const 打开HTTPS代理TLS = async (allowChacha) => {
 		const proxySocket = TCP连接({ hostname, port });
 		try {
-			await proxySocket.opened;
-			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha });
+			await withTimeout(proxySocket.opened, CONNECT_TIMEOUT_MS, 'HTTPS 代理连接超时');
+			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha, timeout: CONNECT_TIMEOUT_MS });
 			await socket.handshake();
 			log(`[HTTPS代理] TLS版本: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
 			return socket;
@@ -3074,10 +3145,11 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, pars
 	};
 	try {
 		try {
-			tlsSocket = await 打开HTTPS代理TLS(false);
+			tlsSocket = await 打开HTTPS代理TLS(HTTPS代理ChaCha缓存.get(`${hostname}:${port}`) || false);
 		} catch (error) {
 			if (!/cipher|handshake|TLS Alert|ServerHello|Finished|Unsupported|Missing TLS/i.test(error?.message || `${error || ''}`)) throw error;
 			log(`[HTTPS代理] AES-GCM TLS 握手失败，回退 ChaCha20 兼容模式: ${error?.message || error}`);
+			HTTPS代理ChaCha缓存.set(`${hostname}:${port}`, true);
 			tlsSocket = await 打开HTTPS代理TLS(true);
 		}
 
@@ -3087,7 +3159,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, pars
 
 		let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
 		while (headerEndIndex === -1 && bytesRead < 8192) {
-			const value = await tlsSocket.read();
+			const value = await withTimeout(tlsSocket.read(), CONNECT_TIMEOUT_MS, 'HTTPS 代理 CONNECT 响应超时');
 			if (!value) throw new Error('HTTPS 代理在返回 CONNECT 响应前关闭连接');
 			responseBuffer = 拼接字节数据(responseBuffer, value);
 			bytesRead = responseBuffer.length;
@@ -4445,16 +4517,27 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 			};
 		};
 
-		await withTimeout(writer.write(buildTcpFrame(0x02)), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN write timed out');
-		sequenceNumber = (sequenceNumber + 1) >>> 0;
-		let tcpReady = false;
+		const synFrame = buildTcpFrame(0x02);
+		await withTimeout(writer.write(synFrame), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN write timed out');
+		let tcpReady = false, syn重发次数 = 0;
 		for (let attempt = 0; attempt < 30; attempt++) {
-			const packet = await readPacket(CONNECT_TIMEOUT_MS);
+			let packet;
+			try {
+				packet = await readPacket(CONNECT_TIMEOUT_MS);
+			} catch (err) {
+				if (!/SSTP .*timeout/.test(err?.message || '')) throw err;
+				if (syn重发次数 >= 4) throw err;
+				syn重发次数++;
+				log(`[SSTP] SYN-ACK 超时，重发 SYN (${syn重发次数}/5)`);
+				await withTimeout(writer.write(synFrame), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN retry write timed out');
+				continue;
+			}
 			if (packet.isControl) continue;
 			const ppp = parsePPPFrame(packet.body);
 			if (!ppp || ppp.protocol !== 0x0021) continue;
 			const tcp = matchIncomingIpPacket(ppp.ipPacket);
 			if (!tcp || (tcp.flags & 0x12) !== 0x12) continue;
+			sequenceNumber = (sequenceNumber + 1) >>> 0;
 			acknowledgementNumber = (tcp.sequence + 1) >>> 0;
 			await withTimeout(writer.write(buildTcpFrame(0x10)), CONNECT_TIMEOUT_MS, 'SSTP TCP ACK write timed out');
 			tcpReady = true;
