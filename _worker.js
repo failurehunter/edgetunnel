@@ -1,12 +1,16 @@
 const Version = '2026-07-29 23:57:34';
-let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
+let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
-let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
+const 清理等待超时毫秒 = 3000;
+const 木马UDP缓存上限 = 128 * 1024;
+let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false, 连接空闲超时 = 15 * 1000;
+const CIDR缓存TTL毫秒 = 60 * 60 * 1000;
+let CIDR列表缓存 = new Map();
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -16,6 +20,7 @@ const 特征码字典 = [
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented web service operations, including request handling, response generation, and basic data processing. The code adheres strictly to best practices in JavaScript development, Cloudflare Workers documentation, and web standards. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de Cloudflare Workers y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of Cloudflare's platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for Cloudflare Workers environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
 export default {
 	async fetch(request, env, ctx) {
+		let config_JSON;
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -35,11 +40,12 @@ export default {
 		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
-		调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
-		预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL) || 预加载竞速拨号;
-		反代并发拨号数 = Math.max(1, Number(env.PROXY_CONCURRENT_DIAL) || 反代并发拨号数);
-		TCP并发拨号数 = Math.max(1, Number(env.TCP_CONCURRENT_DIAL) || TCP并发拨号数);
-		if (!env.TCP_CONCURRENT_DIAL && TCP并发拨号数 !== 1 && 识别运营商(request) === 'cmcc') TCP并发拨号数 = 1;
+		调试日志打印 = ['1', 'true'].includes(env.DEBUG);
+		预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL);
+		反代并发拨号数 = Math.max(1, Number(env.PROXY_CONCURRENT_DIAL) || 1);
+		TCP并发拨号数 = Math.max(1, Number(env.TCP_CONCURRENT_DIAL) || 2);
+		连接空闲超时 = Math.max(1000, Number(env.IDLE_TIMEOUT_MS) || 15 * 1000);
+		const 有效TCP并发拨号数 = (!env.TCP_CONCURRENT_DIAL && 识别运营商(request) === 'cmcc') ? 1 : TCP并发拨号数;
 		let 默认反代IP = (`${request.cf.colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
 		if (env.PROXYIP) {
 			const proxyIPs = await 整理成数组(env.PROXYIP);
@@ -66,10 +72,14 @@ export default {
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			if (反代上下文 instanceof Response) return 反代上下文;
+			反代上下文.TCP并发拨号数 = 有效TCP并发拨号数;
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url, 反代上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/XHTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			if (反代上下文 instanceof Response) return 反代上下文;
+			反代上下文.TCP并发拨号数 = 有效TCP并发拨号数;
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding', 14) || referer.includes('x_padding=');
 			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
@@ -552,7 +562,7 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}) {
 		return new Response('UDP is not supported', { status: 400 });
 	}
 
-	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
+	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve(), 最近上行时间: 0, 最近下行时间: 0 };
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
@@ -625,7 +635,8 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}) {
 					失效远端连接();
 					closeSocketQuietly(xhttpBridge);
 				},
-				名称: 'XHTTP上行'
+				名称: 'XHTTP上行',
+				onWrote: () => { if (remoteConnWrapper) remoteConnWrapper.最近上行时间 = Date.now(); }
 			});
 
 			const 写入远端 = async (payload, allowRetry = true) => {
@@ -663,10 +674,10 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}) {
 				}
 
 				if (!首包.isUDP) {
-					await 上行写入队列.等待空();
+					try { await withTimeout(上行写入队列.等待空(), 清理等待超时毫秒, '上行队列等待超时') } catch (e) { 转发失败 = true; }
 					const writer = 获取远端写入器();
 					if (writer) {
-						try { await writer.close() } catch (e) { }
+						try { await withTimeout(writer.close(), 清理等待超时毫秒, '远端写入器关闭超时') } catch (e) { 转发失败 = true; }
 					}
 				}
 			} catch (err) {
@@ -710,6 +721,8 @@ function 失效TCP连接世代(remoteConnWrapper) {
 }
 
 function 开始TCP连接世代(remoteConnWrapper) {
+	remoteConnWrapper.最近上行时间 = 0;
+	remoteConnWrapper.最近下行时间 = 0;
 	if (!Number.isInteger(remoteConnWrapper.generation)) remoteConnWrapper.generation = 0;
 	const generation = ++remoteConnWrapper.generation;
 	const previousSocket = remoteConnWrapper.socket;
@@ -892,11 +905,12 @@ async function 读取XHTTP首包(reader, token) {
 async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
-	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
+	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve(), 最近上行时间: 0, 最近下行时间: 0 };
 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
 	let 判断是否是木马 = null;
+	let GRPC已验证首包 = null;
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
@@ -1017,17 +1031,19 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 				当前写入Socket = null;
 			};
 
+			const 获取远端写入器 = () => {
+				const socket = remoteConnWrapper.socket;
+				if (!socket) return null;
+				if (socket !== 当前写入Socket) {
+					释放远端写入器();
+					当前写入Socket = socket;
+					远端写入器 = socket.writable.getWriter();
+				}
+				return 远端写入器;
+			};
+
 			const 上行写入队列 = GRPC上行写入队列 = 创建上行写入队列({
-				获取写入器: () => {
-					const socket = remoteConnWrapper.socket;
-					if (!socket) return null;
-					if (socket !== 当前写入Socket) {
-						释放远端写入器();
-						当前写入Socket = socket;
-						远端写入器 = socket.writable.getWriter();
-					}
-					return 远端写入器;
-				},
+				获取写入器: 获取远端写入器,
 				获取连接任务: () => remoteConnWrapper.connectingPromise,
 				释放写入器: 释放远端写入器,
 				重试连接: async () => {
@@ -1035,7 +1051,8 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				名称: 'gRPC上行'
+				名称: 'gRPC上行',
+				onWrote: () => { if (remoteConnWrapper) remoteConnWrapper.最近上行时间 = Date.now(); }
 			});
 
 			const 写入远端 = async (payload, allowRetry = true) => {
@@ -1087,9 +1104,12 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
 							const 首包bytes = 数据转Uint8Array(payload);
-							if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							if (判断是否是木马 === null) {
+								GRPC已验证首包 = 双重验证首包(首包bytes, yourUUID);
+								判断是否是木马 = GRPC已验证首包.协议 === '木马';
+							}
 							if (判断是否是木马) {
-								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
+								const 解析结果 = (GRPC已验证首包?.协议 === '木马' && GRPC已验证首包.结果) ? GRPC已验证首包.结果 : 解析木马请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
 								const { port, hostname, rawClientData, isUDP } = 解析结果;
 								log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
@@ -1108,7 +1128,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 								}
 							} else {
 								判断是否是木马 = false;
-								const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
+								const 解析结果 = (GRPC已验证首包?.协议 === '魏烈思' && GRPC已验证首包.结果) ? GRPC已验证首包.结果 : 解析魏烈思请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 								const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 								log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
@@ -1133,7 +1153,13 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 					}
 					刷新发送队列();
 				}
-				await 上行写入队列.等待空();
+				if (!isDnsQuery) {
+					try { await withTimeout(上行写入队列.等待空(), 清理等待超时毫秒, '上行队列等待超时') } catch (e) { 转发失败 = true; }
+					const writer = 获取远端写入器();
+					if (writer) {
+						try { await withTimeout(writer.close(), 清理等待超时毫秒, '远端写入器关闭超时') } catch (e) { 转发失败 = true; }
+					}
+				}
 			} catch (err) {
 				转发失败 = true;
 				log(`[gRPC转发] 处理失败: ${err?.message || err}`);
@@ -1206,7 +1232,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
 	catch (_) { serverSock.accept() }
 	serverSock.binaryType = 'arraybuffer';
-	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
+	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve(), 最近上行时间: 0, 最近下行时间: 0 };
 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
@@ -1218,6 +1244,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
+	let WS已验证首包 = null;
 	let ss上下文 = null, ss初始化任务 = null;
 	let WS本地测速模式 = false, WS本地测速回包Socket = null;
 	let WS本地测速请求缓存 = new Uint8Array(0);
@@ -1292,7 +1319,8 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			await remoteConnWrapper.retryConnect();
 		},
 		关闭连接: err => 处理WS显式传输错误(err),
-		名称: 'WS上行'
+		名称: 'WS上行',
+		onWrote: () => { if (remoteConnWrapper) remoteConnWrapper.最近上行时间 = Date.now(); }
 	});
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
@@ -1566,7 +1594,8 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			else {
 				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
 				const bytes = 当前块字节;
-				判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? '木马' : '魏烈思';
+				WS已验证首包 = 双重验证首包(bytes, yourUUID);
+				判断协议类型 = WS已验证首包.协议;
 			}
 			判断是否是木马 = 判断协议类型 === '木马';
 			log(`[WS转发] 协议类型: ${判断协议类型} | 来自: ${url.host} | UA: ${request.headers.get('user-agent') || '未知'}`);
@@ -1578,7 +1607,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 		}
 		if (await 写入远端(chunk)) return;
 		if (判断协议类型 === '木马') {
-			const 解析结果 = 解析木马请求(chunk, yourUUID);
+			const 解析结果 = (WS已验证首包?.协议 === '木马' && WS已验证首包.结果) ? WS已验证首包.结果 : 解析木马请求(chunk, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
 			const { port, hostname, rawClientData, isUDP } = 解析结果;
 			if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
@@ -1598,7 +1627,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			判断是否是木马 = false;
 			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
 			const bytes = 当前块字节;
-			const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
+			const 解析结果 = (WS已验证首包?.协议 === '魏烈思' && WS已验证首包.结果) ? WS已验证首包.结果 : 解析魏烈思请求(bytes, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 			const respHeader = new Uint8Array([version, 0]);
@@ -1668,7 +1697,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 		WS显式传输停止接收 = true;
 		追加WS显式传输任务(async () => {
 			if (WS显式传输失败) return;
-			await 上行写入队列.等待空();
+			try { await withTimeout(上行写入队列.等待空(), 清理等待超时毫秒, '上行队列等待超时') } catch (e) { }
 			释放远端写入器();
 			失效远端连接();
 			try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
@@ -1766,6 +1795,18 @@ async function 转发木马UDP反代数据(chunk, webSocket, 上下文, request)
 	const writer = 上下文.反代Socket.writable.getWriter();
 	try { await writer.write(data) }
 	finally { try { writer.releaseLock() } catch (e) { } }
+}
+
+function 双重验证首包(bytes, token) {
+	let 木马解析 = null;
+	const 疑似木马 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a;
+	if (疑似木马) {
+		木马解析 = 解析木马请求(bytes, token);
+		if (!木马解析?.hasError) return { 协议: '木马', 结果: 木马解析 };
+	}
+	const 魏烈思解析 = 解析魏烈思请求(bytes, token);
+	if (!魏烈思解析?.hasError) return { 协议: '魏烈思', 结果: 魏烈思解析 };
+	return { 协议: 疑似木马 ? '木马' : '魏烈思', 结果: 疑似木马 ? 木马解析 : 魏烈思解析 };
 }
 
 function 解析木马请求(buffer, passwordPlainText) {
@@ -2022,7 +2063,10 @@ async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
 		});
 	}
 
-	if (上下文) 上下文.缓存 = input.slice(cursor);
+	if (上下文) {
+		const 剩余缓存 = input.slice(cursor);
+		上下文.缓存 = 剩余缓存.byteLength <= 木马UDP缓存上限 ? 剩余缓存 : new Uint8Array(0);
+	}
 }
 
 function SS递增Nonce计数器(counter) {
@@ -2088,7 +2132,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	let 反代数组索引 = 0;
 	let 选定反代 = null;
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
-	const 连接超时毫秒 = 1000;
+	const 连接超时毫秒 = 5000;
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request);
 	const 使用木马反代 = 允许木马反代 && (反代上下文.木马反代地址 || null);
@@ -2189,7 +2233,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			const data = r.data;
 			return r.type === 28 && typeof data === 'string' && isIPHostname(data) ? [data] : [];
 		}))];
-		const 拨号上限 = Math.max(1, TCP并发拨号数 | 0);
+		const 拨号上限 = Math.max(1, (反代上下文?.TCP并发拨号数 ?? TCP并发拨号数) | 0);
 		const ipList = ipv4List.length >= 拨号上限
 			? ipv4List.slice(0, 拨号上限)
 			: ipv4List.concat(ipv6List.slice(0, 拨号上限 - ipv4List.length));
@@ -2339,6 +2383,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
 				}
 				await 安装当前连接(newSocket, 当前连接世代, downlinkDrain);
+				if (有效数据长度(本次首包数据) > 0) remoteConnWrapper.最近上行时间 = Date.now();
 				if (本次发送首包) 已通过代理发送首包 = true;
 			} catch (err) {
 				try { newSocket?.close?.() } catch (e) { }
@@ -2380,6 +2425,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				if (remoteConnWrapper.generation !== 直连世代 || remoteConnWrapper.socket !== initialSocket) return;
 				await connecttoPry();
 			});
+			if (有效数据长度(rawData) > 0) remoteConnWrapper.最近上行时间 = Date.now();
 		} catch (err) {
 			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
 			if (remoteConnWrapper.generation !== 直连世代) throw err;
@@ -2527,7 +2573,7 @@ function 创建Grain收纳器(容量, 复制合包结果 = false) {
 	};
 }
 
-function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, 名称 = '上行队列' }) {
+function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, onWrote = null, 名称 = '上行队列' }) {
 	const grain = 创建Grain收纳器(上行合包目标字节);
 	let draining = false;
 	let closed = false;
@@ -2595,6 +2641,7 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 					if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 					try {
 						await writer.write(item.chunk);
+						onWrote?.(item.chunk);
 					} catch (err) {
 						释放写入器?.();
 						if (closed) break;
@@ -2604,6 +2651,7 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 						writer = 获取写入器();
 						if (!writer) throw err;
 						await writer.write(item.chunk);
+						onWrote?.(item.chunk);
 					}
 					settleCompletions(completions);
 				} catch (err) {
@@ -2872,9 +2920,28 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 }
 
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null) {
-	let header = headerData, hasData = false, reader, useBYOB = false, readError = null;
+	let header = headerData, hasData = false, reader, useBYOB = false, readError = null, 空闲超时命中 = false;
 	const BYOB单次读取上限 = 64 * 1024;
 	const 当前连接仍有效 = () => !isCurrentSocket || isCurrentSocket();
+	const 读取块 = (readPromise) => new Promise((resolve, reject) => {
+		let settled = false;
+		const timer = setInterval(() => {
+			const 最近上行 = remoteConnWrapper?.最近上行时间 || 0;
+			const 最近下行 = remoteConnWrapper?.最近下行时间 || 0;
+			if (!settled && 最近上行 > 最近下行 && Date.now() - 最近上行 >= 连接空闲超时) {
+				settled = true;
+				clearInterval(timer);
+				空闲超时命中 = true;
+				log(`[TCP下行] 客户端最后一次上行 ${连接空闲超时}ms 无响应，判定连接无响应超时并关闭`);
+				if (remoteConnWrapper) 失效TCP连接世代(remoteConnWrapper);
+				resolve({ done: true });
+			}
+		}, 1000);
+		readPromise.then(
+			(result) => { if (!settled) { settled = true; clearInterval(timer); resolve(result); } },
+			(err) => { if (!settled) { settled = true; clearInterval(timer); reject(err); } }
+		);
+	});
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, 当前连接仍有效);
 	header = null;
 	const 下行控制器 = { 停止并刷新: () => 下行发送器.停止并刷新() };
@@ -2887,7 +2954,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 	try {
 		if (!useBYOB) {
 			while (true) {
-				const { done, value } = await reader.read();
+				const { done, value } = await 读取块(reader.read());
 				if (!当前连接仍有效()) break;
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
@@ -2899,11 +2966,12 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 					await 下行发送器.发送(value);
 				}
 				if (!remoteConnWrapper?.downlink已开始) remoteConnWrapper.downlink已开始 = true;
+				if (remoteConnWrapper) remoteConnWrapper.最近下行时间 = Date.now();
 			}
 		} else {
 			let readBuffer = new ArrayBuffer(BYOB单次读取上限);
 			while (true) {
-				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限));
+				const { done, value } = await 读取块(reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限)));
 				if (!当前连接仍有效()) break;
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
@@ -2917,6 +2985,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 					readBuffer = value.buffer.byteLength >= BYOB单次读取上限 ? value.buffer : new ArrayBuffer(BYOB单次读取上限);
 				}
 				if (!remoteConnWrapper?.downlink已开始) remoteConnWrapper.downlink已开始 = true;
+				if (remoteConnWrapper) remoteConnWrapper.最近下行时间 = Date.now();
 			}
 		}
 		if (当前连接仍有效()) await 下行发送器.flush();
@@ -2930,13 +2999,17 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 		try { reader.releaseLock() } catch (e) { }
 		try { remoteSocket.close() } catch (e) { }
 	}
-	if (!hasData && retryFunc && webSocket.readyState === WebSocket.OPEN && 当前连接仍有效()) {
+	if (!hasData && !空闲超时命中 && retryFunc && webSocket.readyState === WebSocket.OPEN && 当前连接仍有效()) {
 		try {
 			await retryFunc();
 			return;
 		} catch (err) {
 			readError ||= err;
 		}
+	}
+	if (空闲超时命中) {
+		closeSocketQuietly(webSocket);
+		return;
 	}
 	if (!当前连接仍有效()) return;
 	if (readError) log(`[TCP下行] 读取失败: ${readError?.message || readError}`);
@@ -5261,6 +5334,13 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 		是否写入KV日志 = ['1', 'true'].includes(env.OFF_LOG) ? false : 是否写入KV日志;
 		if (!是否写入KV日志) return;
 		let 日志数组 = [];
+		const 裁剪日志至容量上限 = () => {
+			const 单条字节 = 日志数组.map(条目 => ((JSON.stringify(条目)?.length || 0) * 3 / 2 | 0) + 8);
+			const 总字节 = 单条字节.reduce((a, b) => a + b, 0), 容量字节 = KV容量限制 * 1024 * 1024;
+			let 已累计 = 0, 移除数 = 0;
+			while (移除数 < 日志数组.length && 总字节 - 已累计 > 容量字节) { 已累计 += 单条字节[移除数]; 移除数++; }
+			if (总字节 > 容量字节) 日志数组.splice(0, 移除数);
+		};
 		const 现有日志 = await env.KV.get('log.json'), KV容量限制 = 4;//MB
 		if (现有日志) {
 			try {
@@ -5270,10 +5350,10 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 					const 三十分钟前时间戳 = 当前时间.getTime() - 30 * 60 * 1000;
 					if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === request.url && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
 					日志数组.push(日志内容);
-					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
+					裁剪日志至容量上限();
 				} else {
 					日志数组.push(日志内容);
-					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
+					裁剪日志至容量上限();
 				}
 			} catch (e) { 日志数组 = [日志内容] }
 		} else { 日志数组 = [日志内容] }
@@ -5488,6 +5568,7 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 }
 
 async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
+	let config_JSON;
 	const _p = 特征码字典[0];
 	const host = hostname, Ali_DoH = "https://dns.alidns.com/dns-query", ECH_SNI = "cloudflare-ech.com", 占位符 = '{{IP:PORT}}', 初始化开始时间 = performance.now(), 默认配置JSON = {
 		TIME: new Date().toISOString(),
@@ -5777,7 +5858,13 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const cfname = 运营商名称映射[运营商文件标识] || 'CF官方优选';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
 	let cidrList = [];
-	try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+	const 缓存条目 = CIDR列表缓存.get(cidr_url);
+	if (缓存条目 && Date.now() - 缓存条目.时间 < CIDR缓存TTL毫秒) {
+		cidrList = 缓存条目.列表;
+	} else {
+		try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+		CIDR列表缓存.set(cidr_url, { 时间: Date.now(), 列表: cidrList });
+	}
 
 	const generateRandomIPFromCIDR = (cidr) => {
 		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength), hostBits = 32 - prefix;
@@ -6061,7 +6148,12 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 
 async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代兜底 = true) {
 	const { searchParams } = url;
-	const pathname = decodeURIComponent(url.pathname);
+	let pathname;
+	try {
+		pathname = decodeURIComponent(url.pathname);
+	} catch (e) {
+		return new Response('Invalid URL-encoded path', { status: 400 });
+	}
 	const pathLower = pathname.toLowerCase();
 	let 反代IP = 默认反代IP, 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {}, 启用反代兜底 = 默认反代兜底;
 	const 反代上下文 = { 木马反代地址: null, 反代IP, 代理类型: null, 代理账号: '', 代理全局: false, 代理参数: {}, 反代兜底: 启用反代兜底 };
