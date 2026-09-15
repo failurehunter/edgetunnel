@@ -10,6 +10,12 @@ const 清理等待超时毫秒 = 3000;
 const DoH查询超时毫秒 = 5000;
 const 连接完全空闲超时毫秒 = 120 * 1000;
 const 木马UDP缓存上限 = 128 * 1024;
+// CPU 让步：避免长连接大文件传输时 CPU 工作堆积在单个未让出的执行段内触发 exceededCpu。
+// 0 表示禁用；实际值在 fetch() 中按 env.CPU_YIELD_BYTES 覆盖。
+let CPU让步字节阈值 = 64 * 1024;
+const 让步 = (typeof scheduler !== 'undefined' && typeof scheduler.wait === 'function')
+	? () => scheduler.wait(0)
+	: () => new Promise(resolve => setTimeout(resolve, 0));
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false, 连接空闲超时 = 15 * 1000;
 let DNS上游主机 = '8.8.4.4', DNS上游端口 = 53;
 const CIDR缓存TTL毫秒 = 60 * 60 * 1000;
@@ -48,6 +54,10 @@ export default {
 		反代并发拨号数 = Math.max(1, Number(env.PROXY_CONCURRENT_DIAL) || 1);
 		TCP并发拨号数 = Math.max(1, Number(env.TCP_CONCURRENT_DIAL) || 2);
 		连接空闲超时 = Math.max(1000, Number(env.IDLE_TIMEOUT_MS) || 15 * 1000);
+		{
+			const 配置让步阈值 = env.CPU_YIELD_BYTES !== undefined ? Number(env.CPU_YIELD_BYTES) : NaN;
+			CPU让步字节阈值 = (Number.isFinite(配置让步阈值) && 配置让步阈值 >= 0) ? 配置让步阈值 : 64 * 1024;
+		}
 		const 上游DNS配置 = env.DNS_UPSTREAM || env.DNS_SERVERS;
 		if (上游DNS配置) {
 			const 上游DNS目标 = 上游DNS配置.trim().replace(/^(udp|tcp|dns):\/\//i, '').split('/')[0];
@@ -926,6 +936,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
 	let 判断是否是木马 = null;
 	let GRPC已验证首包 = null;
+	let 使用Protobuf封装 = null;
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
@@ -971,16 +982,21 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 					}
 					lenBytes数组.push(remaining);
 					const lenBytes = new Uint8Array(lenBytes数组);
-					const protobufLen = 1 + lenBytes.length + chunk.byteLength;
-					const frame = new Uint8Array(5 + protobufLen);
+					const 封装前缀字节 = (使用Protobuf封装 === false) ? 0 : 1 + lenBytes.length;
+					const grpc消息长度 = 封装前缀字节 + chunk.byteLength;
+					const frame = new Uint8Array(5 + grpc消息长度);
 					frame[0] = 0;
-					frame[1] = (protobufLen >>> 24) & 0xff;
-					frame[2] = (protobufLen >>> 16) & 0xff;
-					frame[3] = (protobufLen >>> 8) & 0xff;
-					frame[4] = protobufLen & 0xff;
-					frame[5] = 0x0a;
-					frame.set(lenBytes, 6);
-					frame.set(chunk, 6 + lenBytes.length);
+					frame[1] = (grpc消息长度 >>> 24) & 0xff;
+					frame[2] = (grpc消息长度 >>> 16) & 0xff;
+					frame[3] = (grpc消息长度 >>> 8) & 0xff;
+					frame[4] = grpc消息长度 & 0xff;
+					if (封装前缀字节 > 0) {
+						frame[5] = 0x0a;
+						frame.set(lenBytes, 6);
+						frame.set(chunk, 6 + lenBytes.length);
+					} else {
+						frame.set(chunk, 5);
+					}
 					发送队列.push(frame);
 					队列字节数 += frame.byteLength;
 					安排刷新发送队列();
@@ -1089,13 +1105,33 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 
 			let 转发失败 = false;
 			try {
-				const MAX_GRPC_FRAME_SIZE = 4 * 1024 * 1024;
+				const MAX_GRPC_FRAME_SIZE = 8 * 1024 * 1024;
 				let pending = new Uint8Array(0);
+				const 解压gRPC消息 = async (压缩数据) => {
+					if (typeof DecompressionStream !== 'function') throw new Error('нет DecompressionStream');
+					const 流 = new Blob([压缩数据]).stream().pipeThrough(new DecompressionStream('gzip'));
+					return new Uint8Array(await new Response(流).arrayBuffer());
+				};
+				const 解析protobuf负载 = (buf) => {
+					if (buf.byteLength < 2 || buf[0] !== 0x0a) return { ok: false };
+					let 声明长度 = 0, factor = 1, offset = 1;
+					let varint有效 = false;
+					while (offset < buf.byteLength) {
+						const current = buf[offset++];
+						声明长度 += (current & 0x7f) * factor;
+						if ((current & 0x80) === 0) { varint有效 = true; break; }
+						factor *= 128;
+						if (factor > 0x1ffffffff) break;
+					}
+					if (!varint有效 || offset + 声明长度 > buf.byteLength) return { ok: false };
+					return { ok: true, payload: buf.subarray(offset, offset + 声明长度) };
+				};
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) {
 						if (pending.byteLength > 0) {
-							log(`[gRPC] EOF с незавершённым frame (${pending.byteLength}B), отбрасываю`);
+							log(`[gRPC] EOF с незавершённым frame (${pending.byteLength}B), статус INTERNAL`);
+							grpc最终状态 = 13;
 						}
 						break;
 					}
@@ -1107,6 +1143,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 					pending = merged;
 					let cursor = 0;
 					while (pending.byteLength - cursor >= 5) {
+						const 压缩标志 = pending[cursor] & 0x01;
 						const grpcLen = ((pending[cursor + 1] << 24) >>> 0) | (pending[cursor + 2] << 16) | (pending[cursor + 3] << 8) | pending[cursor + 4];
 						const frameSize = 5 + grpcLen;
 						if (frameSize > MAX_GRPC_FRAME_SIZE) {
@@ -1116,80 +1153,97 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 							break;
 						}
 						if (pending.byteLength - cursor < frameSize) break;
-						const grpcPayload = pending.subarray(cursor + 5, cursor + frameSize);
-						if (grpcPayload.byteLength > 0 && !(grpcPayload[0] & 0x01)) {
-							let payload = grpcPayload;
-							if (payload.byteLength >= 2 && payload[0] === 0x0a) {
-								let shift = 0;
-								let offset = 1;
-								let varint有效 = false;
-								while (offset < payload.length) {
-									const current = payload[offset++];
-									if ((current & 0x80) === 0) { varint有效 = true; break; }
-									shift += 7;
-									if (shift >= 28) break;
-								}
-								if (varint有效) payload = payload.subarray(offset);
+						let grpcPayload = pending.subarray(cursor + 5, cursor + frameSize);
+						if (压缩标志) {
+							try {
+								grpcPayload = await 解压gRPC消息(grpcPayload);
+							} catch (err) {
+								log(`[gRPC] не удалось распаковать кадр: ${err?.message || err}`);
+								转发失败 = true;
+								cursor = pending.byteLength;
+								break;
 							}
-							if (payload.byteLength > 0) {
-								if (isDnsQuery) {
-									if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(dnsOverTCPPrefix(payload), grpcBridge, null, request, grpcDNSDeframer);
-								} else if (remoteConnWrapper.socket || remoteConnWrapper.connectingPromise) {
-									if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
-								} else {
-									const 首包bytes = 数据转Uint8Array(payload);
-									if (判断是否是木马 === null) {
-										GRPC已验证首包 = 双重验证首包(首包bytes, yourUUID);
-										判断是否是木马 = GRPC已验证首包.协议 === '木马';
+						}
+						let payload = grpcPayload;
+						if (使用Protobuf封装 === null) {
+							const 候选列表 = [];
+							const proto = 解析protobuf负载(grpcPayload);
+							if (proto.ok && proto.payload.byteLength > 0) 候选列表.push({ 封装: true, 数据: proto.payload });
+							if (grpcPayload.byteLength > 0) 候选列表.push({ 封装: false, 数据: grpcPayload });
+							let 命中 = null;
+							for (const 尝试 of 候选列表) {
+								const 尝试bytes = 数据转Uint8Array(尝试.数据);
+								const 验证 = 双重验证首包(尝试bytes, yourUUID);
+								if (!验证.结果?.hasError) { 命中 = { 封装: 尝试.封装, 数据: 尝试.数据, 验证 }; break; }
+							}
+							if (命中) {
+								使用Protobuf封装 = 命中.封装;
+								GRPC已验证首包 = 命中.验证;
+								判断是否是木马 = 命中.验证.协议 === '木马';
+								payload = 命中.数据;
+							}
+						} else if (使用Protobuf封装) {
+							const proto = 解析protobuf负载(grpcPayload);
+							payload = (proto.ok && proto.payload.byteLength > 0) ? proto.payload : new Uint8Array(0);
+						}
+						if (payload.byteLength > 0) {
+							if (isDnsQuery) {
+								if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
+								else await forwardataudp(dnsOverTCPPrefix(payload), grpcBridge, null, request, grpcDNSDeframer);
+							} else if (remoteConnWrapper.socket || remoteConnWrapper.connectingPromise) {
+								if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
+							} else {
+								const 首包bytes = 数据转Uint8Array(payload);
+								if (判断是否是木马 === null) {
+									GRPC已验证首包 = 双重验证首包(首包bytes, yourUUID);
+									判断是否是木马 = GRPC已验证首包.协议 === '木马';
+								}
+								if (判断是否是木马) {
+									const 解析结果 = (GRPC已验证首包?.协议 === '木马' && GRPC已验证首包.结果) ? GRPC已验证首包.结果 : 解析木马请求(首包bytes, yourUUID);
+									if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
+									const { port, hostname, rawClientData, isUDP } = 解析结果;
+									log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
+									if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
+										grpcBridge.send(构造本地204响应());
+										return;
 									}
-									if (判断是否是木马) {
-										const 解析结果 = (GRPC已验证首包?.协议 === '木马' && GRPC已验证首包.结果) ? GRPC已验证首包.结果 : 解析木马请求(首包bytes, yourUUID);
-										if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
-										const { port, hostname, rawClientData, isUDP } = 解析结果;
-										log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
-										if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
-											grpcBridge.send(构造本地204响应());
-											return;
-										}
-										if (isUDP) {
-											if (port !== 53) throw new Error('UDP is not supported');
-											木马UDP上下文.目标主机 = hostname;
-											木马UDP上下文.目标端口 = port;
-											isDnsQuery = true;
-										}
-										if (有效数据长度(rawClientData) > 0 || (木马UDP上下文.反代地址 && 木马UDP上下文.目标端口 === 53)) {
-											木马UDP上下文.目标主机 = hostname;
-											木马UDP上下文.目标端口 = port;
-										}
-										if (木马UDP上下文.反代地址 && isUDP && port === 53) {
-											await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
-										} else {
-											await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 首包bytes);
-										}
+									if (isUDP) {
+										if (port !== 53) throw new Error('UDP is not supported');
+										木马UDP上下文.目标主机 = hostname;
+										木马UDP上下文.目标端口 = port;
+										isDnsQuery = true;
+									}
+									if (有效数据长度(rawClientData) > 0 || (木马UDP上下文.反代地址 && 木马UDP上下文.目标端口 === 53)) {
+										木马UDP上下文.目标主机 = hostname;
+										木马UDP上下文.目标端口 = port;
+									}
+									if (木马UDP上下文.反代地址 && isUDP && port === 53) {
+										await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
 									} else {
-										判断是否是木马 = false;
-										const 解析结果 = (GRPC已验证首包?.协议 === '魏烈思' && GRPC已验证首包.结果) ? GRPC已验证首包.结果 : 解析魏烈思请求(首包bytes, yourUUID);
-										if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
-										const { port, hostname, version, isUDP, rawClientData } = 解析结果;
-										log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
-										const respHeader = new Uint8Array([version, 0]);
-										if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
-											grpcBridge.send(构造本地204响应(respHeader));
-											return;
-										}
-										if (isUDP) {
-											if (port !== 53) throw new Error('UDP is not supported');
-											isDnsQuery = true;
-										}
-										grpcBridge.send(respHeader);
-										const rawData = rawClientData;
-										if (isDnsQuery) {
-											if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-											else await forwardataudp(dnsOverTCPPrefix(rawData), grpcBridge, null, request, grpcDNSDeframer);
-										}
-										else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文);
+										await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 首包bytes);
 									}
+								} else {
+									判断是否是木马 = false;
+									const 解析结果 = (GRPC已验证首包?.协议 === '魏烈思' && GRPC已验证首包.结果) ? GRPC已验证首包.结果 : 解析魏烈思请求(首包bytes, yourUUID);
+									if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
+									const { port, hostname, version, isUDP, rawClientData } = 解析结果;
+									log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
+									const respHeader = new Uint8Array([version, 0]);
+									if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
+										grpcBridge.send(构造本地204响应(respHeader));
+										return;
+									}
+									if (isUDP) {
+										if (port !== 53) throw new Error('UDP is not supported');
+										isDnsQuery = true;
+									}
+									grpcBridge.send(respHeader);
+									const rawData = rawClientData;
+									if (isDnsQuery) {
+										if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
+										else await forwardataudp(dnsOverTCPPrefix(rawData), grpcBridge, null, request, grpcDNSDeframer);
+									}
+									else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文);
 								}
 							}
 						}
@@ -2213,10 +2267,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	};
 
 	async function 等待连接建立(remoteSock, timeoutMs = 连接超时毫秒) {
-		await Promise.race([
-			remoteSock.opened,
-			new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), timeoutMs))
-		]);
+		// 原实现使用裸 Promise.race + setTimeout，成功路径下定时器从不清除：
+		// 每次成功的 TCP 连接都会留下一个将在 timeoutMs 后触发的孤儿定时器，
+		// 其 reject() 没有任何处理者，属于未处理的 Promise 拒绝，并且徒耗内存/调度直到触发。
+		// withTimeout() 已经在 finally 中正确 clearTimeout，行为与原实现等价（相同错误信息）。
+		await withTimeout(remoteSock.opened, timeoutMs, '连接超时');
 	}
 
 	async function 打开TCP连接(address, port) {
@@ -2657,6 +2712,7 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 	let closed = false;
 	let idleResolvers = [];
 	let activeCompletions = null;
+	let CPU让步已累计字节 = 0;
 
 	const settleCompletions = (completions, err = null) => {
 		if (!completions) return;
@@ -2703,6 +2759,15 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 		return 获取写入器();
 	};
 
+	const 让步IfNeeded = async (发送字节数) => {
+		if (CPU让步字节阈值 <= 0) return;
+		CPU让步已累计字节 += 发送字节数;
+		if (CPU让步已累计字节 >= CPU让步字节阈值) {
+			CPU让步已累计字节 = 0;
+			await 让步();
+		}
+	};
+
 	const drain = async () => {
 		if (draining || closed) return;
 		draining = true;
@@ -2720,6 +2785,7 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 					try {
 						await writer.write(item.chunk);
 						onWrote?.(item.chunk);
+						await 让步IfNeeded(item.chunk.byteLength);
 					} catch (err) {
 						释放写入器?.();
 						if (closed) break;
@@ -2730,6 +2796,7 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 						if (!writer) throw err;
 						await writer.write(item.chunk);
 						onWrote?.(item.chunk);
+						await 让步IfNeeded(item.chunk.byteLength);
 					}
 					settleCompletions(completions);
 				} catch (err) {
@@ -2801,6 +2868,7 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 	const packetCap = 下行Grain包字节;
 	const tailBytes = 下行Grain尾部阈值;
 	const grain = 创建Grain收纳器(packetCap, true);
+	let CPU让步已累计字节 = 0;
 	let header = typeof headerData === 'function' ? null : headerData;
 	const 获取响应头 = typeof headerData === 'function' ? headerData : () => {
 		const value = header;
@@ -2851,7 +2919,16 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 		while (directSendPromise) await directSendPromise;
 		const sendTask = 发送原始块(chunk);
 		directSendPromise = sendTask;
-		try { await sendTask }
+		try {
+			await sendTask;
+			if (CPU让步字节阈值 > 0) {
+				CPU让步已累计字节 += chunk.byteLength;
+				if (CPU让步已累计字节 >= CPU让步字节阈值) {
+					CPU让步已累计字节 = 0;
+					await 让步();
+				}
+			}
+		}
 		finally {
 			if (directSendPromise === sendTask) directSendPromise = null;
 		}
@@ -3001,33 +3078,64 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 	let header = headerData, hasData = false, reader, useBYOB = false, readError = null, 空闲超时命中 = false;
 	const BYOB单次读取上限 = 64 * 1024;
 	const 当前连接仍有效 = () => !isCurrentSocket || isCurrentSocket();
+	let 正在等待读取 = false;
+	let 读取块Resolve = null;
+	let 读取块Reject = null;
+	let 读取块Settled = false;
+
+	const timer = setInterval(() => {
+		if (!正在等待读取 || 读取块Settled) return;
+
+		const 最近上行 = remoteConnWrapper?.最近上行时间 || 0;
+		const 最近下行 = remoteConnWrapper?.最近下行时间 || 0;
+		const 当前时间 = Date.now();
+
+		if (最近上行 > 最近下行 && 当前时间 - 最近上行 >= 连接空闲超时) {
+			读取块Settled = true;
+			正在等待读取 = false;
+			空闲超时命中 = true;
+			log(`[TCP下行] 客户端最后一次上行 ${连接空闲超时}ms 无响应，判定连接无响应超时并关闭`);
+			if (remoteConnWrapper) 失效TCP连接世代(remoteConnWrapper);
+			读取块Resolve?.({ done: true });
+			读取块Resolve = null;
+			读取块Reject = null;
+		}
+		// 双向完全空闲（无上下行活动）超过阈值时，释放占用的远端 socket，避免积累挂起的会话
+		else if (最近上行 > 0 && 最近下行 > 0 && 当前时间 - Math.max(最近上行, 最近下行) >= 连接完全空闲超时毫秒) {
+			读取块Settled = true;
+			正在等待读取 = false;
+			空闲超时命中 = true;
+			log(`[TCP下行] 连接双向空闲超过 ${连接完全空闲超时毫秒}ms，关闭空闲会话`);
+			if (remoteConnWrapper) 失效TCP连接世代(remoteConnWrapper);
+			读取块Resolve?.({ done: true });
+			读取块Resolve = null;
+			读取块Reject = null;
+		}
+	}, 1000);
+
 	const 读取块 = (readPromise) => new Promise((resolve, reject) => {
-		let settled = false;
-		const timer = setInterval(() => {
-			const 最近上行 = remoteConnWrapper?.最近上行时间 || 0;
-			const 最近下行 = remoteConnWrapper?.最近下行时间 || 0;
-			const 当前时间 = Date.now();
-			if (!settled && 最近上行 > 最近下行 && 当前时间 - 最近上行 >= 连接空闲超时) {
-				settled = true;
-				clearInterval(timer);
-				空闲超时命中 = true;
-				log(`[TCP下行] 客户端最后一次上行 ${连接空闲超时}ms 无响应，判定连接无响应超时并关闭`);
-				if (remoteConnWrapper) 失效TCP连接世代(remoteConnWrapper);
-				resolve({ done: true });
-			}
-			// 双向完全空闲（无上下行活动）超过阈值时，释放占用的远端 socket，避免积累挂起的会话
-			else if (!settled && 最近上行 > 0 && 最近下行 > 0 && 当前时间 - Math.max(最近上行, 最近下行) >= 连接完全空闲超时毫秒) {
-				settled = true;
-				clearInterval(timer);
-				空闲超时命中 = true;
-				log(`[TCP下行] 连接双向空闲超过 ${连接完全空闲超时毫秒}ms，关闭空闲会话`);
-				if (remoteConnWrapper) 失效TCP连接世代(remoteConnWrapper);
-				resolve({ done: true });
-			}
-		}, 1000);
+		正在等待读取 = true;
+		读取块Settled = false;
+		读取块Resolve = resolve;
+		读取块Reject = reject;
+
 		readPromise.then(
-			(result) => { if (!settled) { settled = true; clearInterval(timer); resolve(result); } },
-			(err) => { if (!settled) { settled = true; clearInterval(timer); reject(err); } }
+			(result) => {
+				if (读取块Settled) return;
+				读取块Settled = true;
+				正在等待读取 = false;
+				读取块Resolve = null;
+				读取块Reject = null;
+				resolve(result);
+			},
+			(err) => {
+				if (读取块Settled) return;
+				读取块Settled = true;
+				正在等待读取 = false;
+				读取块Resolve = null;
+				读取块Reject = null;
+				reject(err);
+			}
 		);
 	});
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, 当前连接仍有效);
@@ -3752,7 +3860,10 @@ class TlsClient {
 	recordHandshake(chunk) { this.handshakeChunks.push(chunk) }
 	transcript() { return 1 === this.handshakeChunks.length ? this.handshakeChunks[0] : concatBytes(...this.handshakeChunks) }
 	getCipherConfig(cipherSuite) { return CIPHER_SUITES_BY_ID.get(cipherSuite) || null }
-	async readChunk(reader) { return this.timeout ? Promise.race([reader.read(), new Promise(((resolve, reject) => setTimeout((() => reject(new Error("TLS read timeout"))), this.timeout)))]) : reader.read() }
+	// 同样的孤儿定时器问题：原实现在 reader.read() 先完成时不清除 setTimeout，
+	// 而这是每次 TLS record 读取都会执行的路径（握手阶段 + HTTPS 代理转发阶段的每个 read）。
+	// 复用文件中已存在且已正确清理定时器的 withTimeout()。
+	async readChunk(reader) { return this.timeout ? withTimeout(reader.read(), this.timeout, "TLS read timeout") : reader.read() }
 	async readRecordsUntil(reader, predicate, closedError) {
 		for (; ;) {
 			let record;
