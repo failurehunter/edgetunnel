@@ -1124,6 +1124,8 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 			try {
 				const MAX_GRPC_FRAME_SIZE = 8 * 1024 * 1024;
 				let pending = new Uint8Array(0);
+				// U2: локальный байтовый CPU-бюджет для inbound merge-копий (как в зерне/очереди — пер-скоуп).
+				let CPU让步已累计字节 = 0;
 				const 解压gRPC消息 = async (压缩数据) => {
 					if (typeof DecompressionStream !== 'function') throw new Error('нет DecompressionStream');
 					const 流 = new Blob([压缩数据]).stream().pipeThrough(new DecompressionStream('gzip'));
@@ -1158,6 +1160,19 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 					merged.set(pending, 0);
 					merged.set(当前块, pending.byteLength);
 					pending = merged;
+					// U2: merge-копия учитывается в CPU-бюджет; yield — макротаск между сегментами.
+					// Обычный путь (pending пуст): копия = chunk — счётчик точен. Фрагментированные
+					// крупные фреймы: копия = pending+chunk (недосчёт), но reader.read() между
+					// chunk-ами — реальный I/O-await, отделяющий сегменты; yield рвёт серии
+					// буферизованных chunk-ов без уступки. Остаточный риск: завершающая merge-копия
+					// гигантского фрейма (до MAX_GRPC_FRAME_SIZE = 8MB) — один синхронный сегмент.
+					if (CPU让步字节阈值 > 0) {
+						CPU让步已累计字节 += 当前块.byteLength;
+						if (CPU让步已累计字节 >= CPU让步字节阈值) {
+							CPU让步已累计字节 = 0;
+							await 让步();
+						}
+					}
 					let cursor = 0;
 					while (pending.byteLength - cursor >= 5) {
 						const 压缩标志 = pending[cursor] & 0x01;
