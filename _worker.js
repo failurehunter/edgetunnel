@@ -17,6 +17,13 @@ const 让步 = (typeof scheduler !== 'undefined' && typeof scheduler.wait === 'f
 	? () => scheduler.wait(0)
 	: () => new Promise(resolve => setTimeout(resolve, 0));
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false, 连接空闲超时 = 15 * 1000;
+// Pre-data egress-ретраи: строгий бюджет на ВСЮ pre-data фазу сессии (без сброса, 0 = отключено).
+// Флапающий пул не может зацикливаться «пустой успех→отказ→ретрай»: пустой коннект не даёт новых попыток.
+// Значение из env.MAX_EGRESS_RETRY в fetch(). Пост-data ретрай намеренно запрещён
+// (см. connecttoPry) — прозрачный TLS-проброс не переживает середину потока.
+// Известная нестыковка: первый переход direct→proxy после падения direct (connecttoPry() без 是重试)
+// в бюджет не засчитывается — фактический потолок диалов = 1(direct) + 1(переход на proxy) + 重连上限.
+let 重连上限 = 2;
 let DNS上游主机 = '8.8.4.4', DNS上游端口 = 53;
 const CIDR缓存TTL毫秒 = 60 * 60 * 1000;
 let CIDR列表缓存 = new Map();
@@ -57,6 +64,10 @@ export default {
 		{
 			const 配置让步阈值 = env.CPU_YIELD_BYTES !== undefined ? Number(env.CPU_YIELD_BYTES) : NaN;
 			CPU让步字节阈值 = (Number.isFinite(配置让步阈值) && 配置让步阈值 >= 0) ? 配置让步阈值 : 64 * 1024;
+		}
+		{
+			const 配置重连上限 = env.MAX_EGRESS_RETRY !== undefined ? Number(env.MAX_EGRESS_RETRY) : NaN;
+			重连上限 = (Number.isFinite(配置重连上限) && 配置重连上限 >= 0) ? 配置重连上限 : 2;
 		}
 		const 上游DNS配置 = env.DNS_UPSTREAM || env.DNS_SERVERS;
 		if (上游DNS配置) {
@@ -1000,6 +1011,12 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 					发送队列.push(frame);
 					队列字节数 += frame.byteLength;
 					安排刷新发送队列();
+					// Возвращаем длину кадра, чтобы верхний CPU-счётчик (串行发送原始块) учитывал
+					// реальную JS-работу (varint + тег + полная копия payload), а не только сырые TCP-байты.
+					// Синхронная конкат-копия всей очереди в 刷新发送队列 остаётся частично вне учёта —
+					// известный остаточный риск (см. план): при sustained-нагрузке fast-path
+					// `队列字节数 >= 下行缓存上限` копирует до 32КБ синхронно внутри сегмента.
+					return frame.byteLength;
 				},
 				close() {
 					if (this.readyState === WebSocket.CLOSED) return;
@@ -2416,11 +2433,24 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		}
 	}
 
-	async function connecttoPry(允许发送首包 = true) {
+	async function connecttoPry(允许发送首包 = true, 是重试 = false) {
+		// Пост-data ретрай намеренно невозможен: после первого доставленного клиенту байта
+		// повторный диал уже не может продолжить прозрачный TLS-поток (origin заново шлёт
+		// ServerHello в середину сессии). Восстановление корректно выполняется клиентом.
 		if (remoteConnWrapper.downlink已开始) {
 			log(`[TCP下行] 会话中断-已丢弃重连 (${host}:${portNum})`);
 			closeSocketQuietly(ws);
 			throw new Error('downlink已开始，丢弃重连');
+		}
+		// Бюджет pre-data ретраев — строгий лимит на всю pre-data фазу сессии (без сброса):
+		// каждый «пустой» успешный коннект НЕ даёт новых попыток, цикл обязан сходиться.
+		if (是重试) {
+			remoteConnWrapper.重连尝试数 = (remoteConnWrapper.重连尝试数 || 0) + 1;
+			if (remoteConnWrapper.重连尝试数 > 重连上限) {
+				log(`[TCP下行] 重连次数超过上限(${重连上限})，终止会话`);
+				closeSocketQuietly(ws);
+				throw new Error('重连次数超过上限');
+			}
 		}
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
@@ -2479,7 +2509,12 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
 					newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
 				}
-				await 安装当前连接(newSocket, 当前连接世代, downlinkDrain);
+				await 安装当前连接(newSocket, 当前连接世代, downlinkDrain, async () => {
+					if (remoteConnWrapper.generation !== 当前连接世代 || remoteConnWrapper.socket !== newSocket) return;
+					await connecttoPry(true, true);
+				});
+				// Счётчик ретраев НЕ сбрасывается: 重连上限 — строгий лимит на всю pre-data фазу сессии,
+				// чтобы «пустой успех→отказ→ретрай» на флапающем пуле не зацикливался без верхней границы.
 				if (有效数据长度(本次首包数据) > 0) remoteConnWrapper.最近上行时间 = Date.now();
 				if (本次发送首包) 已通过代理发送首包 = true;
 			} catch (err) {
@@ -2507,7 +2542,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			}
 		}
 	}
-	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
+	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包, true);
 
 	if (ctx代理类型 && (ctx代理全局 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
 		log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
@@ -2526,7 +2561,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			await 安装当前连接(initialSocket, 直连世代, 世代连接.downlinkDrain, async () => {
 				if (remoteConnWrapper.generation !== 直连世代 || remoteConnWrapper.socket !== initialSocket) return;
-				await connecttoPry();
+				await connecttoPry(true, true);
 			});
 			if (有效数据长度(rawData) > 0) remoteConnWrapper.最近上行时间 = Date.now();
 		} catch (err) {
@@ -2628,6 +2663,10 @@ function formatIdentifier(arr, offset = 0) {
 async function WebSocket发送并等待(webSocket, payload) {
 	const sendResult = webSocket.send(payload);
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
+	// Возврат = фактический объём JS-работы: для grpcBridge это длина собранного кадра
+	// (varint-заголовок + protobuf-префикс + копия payload), для нативного WebSocket —
+	// размер отправленных байт (фрейминг уже учтён рантаймом).
+	return (typeof sendResult === 'number' && Number.isFinite(sendResult)) ? sendResult : payload.byteLength;
 }
 
 function 创建Grain收纳器(容量, 复制合包结果 = false) {
@@ -2909,10 +2948,11 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 	};
 
 	const 发送原始块 = async (chunk) => {
-		if (!当前发送器有效()) return;
+		// 0 = реальной отправки не было — байты не начисляем.
+		if (!当前发送器有效()) return 0;
 		if (webSocket.readyState !== WebSocket.OPEN) throw new Error('ws.readyState is not open');
 		chunk = 附加响应头(chunk);
-		await WebSocket发送并等待(webSocket, chunk);
+		return await WebSocket发送并等待(webSocket, chunk);
 	};
 
 	const 串行发送原始块 = async (chunk) => {
@@ -2920,9 +2960,11 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 		const sendTask = 发送原始块(chunk);
 		directSendPromise = sendTask;
 		try {
-			await sendTask;
+			const 实际字节数 = await sendTask;
 			if (CPU让步字节阈值 > 0) {
-				CPU让步已累计字节 += chunk.byteLength;
+				// Число (включая 0 — «отправки не было») учитывается как есть;
+				// undefined/не-число — транспорт не вернул стоимость, fallback на сырой chunk.
+				CPU让步已累计字节 += (typeof 实际字节数 === 'number' && Number.isFinite(实际字节数)) ? 实际字节数 : chunk.byteLength;
 				if (CPU让步已累计字节 >= CPU让步字节阈值) {
 					CPU让步已累计字节 = 0;
 					await 让步();
@@ -3195,6 +3237,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 		try { reader.releaseLock() } catch (e) { }
 		try { remoteSocket.close() } catch (e) { }
 	}
+	// Ретрай допустим только пока клиенту не доставлен ни один байт (pre-data):
+	// после hasData=true прозрачный TLS-проброс нельзя продолжить без порчи потока
+	// (см. connecttoPry) — клиент сам пере-подключается и возобновляет передачу.
 	if (!hasData && !空闲超时命中 && retryFunc && webSocket.readyState === WebSocket.OPEN && 当前连接仍有效()) {
 		try {
 			await retryFunc();
