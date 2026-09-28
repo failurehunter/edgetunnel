@@ -9,7 +9,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
     "types": "wrangler types src/worker-configuration.d.ts",
     "test": "vitest run",
-    "hash-frozen": "node test/scripts/hash-frozen.mjs"
+    "hash-frozen": "node test/scripts/hash-frozen.mjs",
+    "check:handlers": "bash scripts/check-handlers-cifgrep.sh"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.3.0",
