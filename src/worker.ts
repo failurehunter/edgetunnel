@@ -1,6 +1,7 @@
 // @ts-nocheck
 // Фаза 3, Шаг 3.1: чистые утилиты вынесены функция-в-функцию в src/util.ts.
 import { 有效数据长度, 数据转Uint8Array, 拼接字节数据, formatIdentifier, stripIPv6Brackets, isIPHostname, isIPv4, 掩码敏感信息, MD5MD5 } from "./util";
+import { 特征码字典, 汇聚订阅_UA } from "./obfuscation-tokens";
 ﻿const Version = '2026-09-22 20:01:17';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -34,13 +35,6 @@ export function 创建请求上下文(request, env, identity = {}) {
 		dial: (options, init) => 创建请求TCP连接器(request)(options, init),
 	};
 }
-///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
-const 特征码字典 = [
-	(Proxy.name + "IP").toUpperCase(),
-	(String.fromCharCode(67, 109) + URL.name[2] + 'i' + URL.name[0]).toLowerCase(),
-	String(2407 * 300 - 10).split('').reverse().join('')
-];
-const 汇聚订阅_UA = 'v2rayN/edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)';
 export default {
 	async fetch(request, env, ctx) {
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
