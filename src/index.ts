@@ -4,6 +4,15 @@ import monolith from "./worker";
 
 const ECHO_PORT = 28333;
 
+// cf-мок для проброса в монолит (SELF-запросы cf не несут).
+const SPIKE_CF = {
+	colo: "HKG",
+	asn: 45102,
+	country: "HK",
+	city: "Hong Kong",
+	asOrganization: "Example-ISP",
+};
+
 function json(x: unknown): Response {
 	return new Response(JSON.stringify(x), {
 		headers: { "content-type": "application/json" },
@@ -84,8 +93,35 @@ export default {
 				await tcpProbe(isConnectFn(f?.connect) ? f.connect.bind(f) : undefined)
 			);
 		}
+		if (url.pathname === "/__spike/ws-echo") {
+			// Изоляция слоёв: ретранслирует ли SELF-loopback WS-фреймы (текст/бинар)?
+			const pair = new WebSocketPair();
+			const [client, server] = Object.values(pair);
+			server.accept();
+			server.addEventListener("message", (e) => {
+				const d = e.data;
+				if (typeof d === "string" || d instanceof ArrayBuffer) {
+					server.send(d);
+				} else if (d && typeof (d as Blob).arrayBuffer === "function") {
+					(d as Blob).arrayBuffer().then((ab) => server.send(ab));
+				} else {
+					server.send(String(d));
+				}
+			});
+			server.addEventListener("close", () => {});
+			return new Response(null, { status: 101, webSocket: client });
+		}
+		// SELF-запросы не несут request.cf (см. test/phase0-spike.notes.md),
+		// а монолит читает cf безусловно (строка 43). Впрыскиваем фиксированный cf.
+		const proxyRequest = new Proxy(request, {
+			get(target, prop) {
+				if (prop === "cf") return SPIKE_CF;
+				const v = Reflect.get(target, prop);
+				return typeof v === "function" ? v.bind(target) : v;
+			},
+		});
 		return monolith.fetch(
-			request as never,
+			proxyRequest as never,
 			env as never,
 			ctx as never
 		) as unknown as Response;
