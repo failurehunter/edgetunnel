@@ -1,6 +1,6 @@
 // Главный воркер = диспетчер харнесса (Шаг 0.3 спайк-пробники + маршрутизация в монолит worker.ts).
 // Фазы 1–2 правят worker.ts; этот файл — тонкая обвязка тестового воркера.
-import monolith from "./worker";
+import monolith from "./entry";
 
 const ECHO_PORT = 28333;
 
