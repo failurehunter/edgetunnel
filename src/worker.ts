@@ -8,6 +8,30 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
+
+// Шаг 1.1 (реестр 1.1, строка 1): настройки запроса собираются чистой функцией.
+// cmcc-пин старой строки 43 удалён — оператор больше не урезает 并发拨号 до 1.
+// Ни одно request-зависимое значение не пишется в module-scope во время обслуживания.
+export function parseSettings(env, request) {
+	return {
+		dialConcurrency: Math.max(1, Number(env?.TCP_CONCURRENT_DIAL) || 2),
+	};
+}
+
+export function 创建请求上下文(request, env, identity = {}) {
+	return {
+		settings: parseSettings(env, request),
+		client: {
+			operator: 识别运营商(request),
+			访问IP: request.headers?.get('CF-Connecting-IP') || request.headers?.get('True-Client-IP') || request.headers?.get('X-Real-IP') || request.headers?.get('X-Forwarded-For') || request.headers?.get('Fly-Client-IP') || request.headers?.get('X-Appengine-Remote-Addr') || request.headers?.get('X-Cluster-Client-IP') || '未知IP',
+			ua: request.headers?.get('User-Agent') || 'null',
+		},
+		identity,
+		// Шов dial: единственное поле контекста (без интерфейса и фабрики).
+		// Лениво — запросы без fetcher (admin/version/...) контекст создают безболезненно.
+		dial: (options, init) => 创建请求TCP连接器(request)(options, init),
+	};
+}
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -39,8 +63,10 @@ export default {
 		调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
 		预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL) || 预加载竞速拨号;
 		反代并发拨号数 = Math.max(1, Number(env.PROXY_CONCURRENT_DIAL) || 反代并发拨号数);
-		TCP并发拨号数 = Math.max(1, Number(env.TCP_CONCURRENT_DIAL) || TCP并发拨号数);
-		if (!env.TCP_CONCURRENT_DIAL && TCP并发拨号数 !== 1 && 识别运营商(request) === 'cmcc') TCP并发拨号数 = 1;
+		// TCP并发拨号数 больше не пишется на уровне запроса (Шаг 1.1, реестр 1.1, строка 1);
+		// значение живёт в RequestContext.settings, см. parseSettings/创建请求上下文.
+		const settings = parseSettings(env, request);
+		const 请求上下文 = 创建请求上下文(request, env, { host, userID });
 		let 默认反代IP = (`${request.cf.colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
 		if (env.PROXYIP) {
 			const proxyIPs = await 整理成数组(env.PROXYIP);
@@ -68,17 +94,17 @@ export default {
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理WS请求(request, userID, url, 反代上下文);
+			return await 处理WS请求(request, userID, url, 反代上下文, 请求上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
 				log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
-				return await 处理gRPC请求(request, userID, 反代上下文);
+				return await 处理gRPC请求(request, userID, 反代上下文, 请求上下文);
 			}
 			log(`[叉HTTP] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理叉HTTP请求(request, userID, 反代上下文);
+			return await 处理叉HTTP请求(request, userID, 反代上下文, 请求上下文);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
 			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
@@ -593,7 +619,7 @@ function 生成叉HTTPPadding串(长度) {
 	return 结果;
 }
 
-async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {}) {
+async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {}, 请求上下文 = null) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(yourUUID);
 	if (!校验叉HTTPPadding(request, 本机Padding头, 本机Padding键)) return new Response('Bad Request', { status: 400 });
@@ -649,7 +675,7 @@ async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {}) {
 
 	let socket;
 	try {
-		socket = await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, 占位WS, 首包.respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, 首包.协议 === 'trojan', 首包.原始数据, true);
+		socket = await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, 占位WS, 首包.respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, 首包.协议 === 'trojan', 首包.原始数据, true, 请求上下文);
 	} catch (err) {
 		log(`[叉HTTP-Pipe] 连接失败: ${err?.message || err}`);
 		清理(err);
@@ -977,7 +1003,7 @@ async function 读取叉HTTP首包(reader, token) {
 	return null;
 }
 ///////////////////////////////////////////////////////////////////////gRPC传输数据///////////////////////////////////////////////
-async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
+async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 请求上下文 = null) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
@@ -1192,7 +1218,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 									if (木马UDP上下文.反代地址) await 转发木马UDP数据(首包bytes, grpcBridge, 木马UDP上下文, request);
 									else if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
 								} else {
-									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 首包bytes);
+									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 首包bytes, 请求上下文);
 								}
 							} else {
 								判断是否是木马 = false;
@@ -1215,7 +1241,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
 									else await forwardataudp(rawData, grpcBridge, null, request);
 								}
-								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文);
+								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
 							}
 						}
 					}
@@ -1288,7 +1314,7 @@ function 解码WS早期数据(header, token) {
 }
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
+async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, 请求上下文 = null) {
 	const WS套接字对 = new WebSocketPair();
 	const [clientSock, serverSock] = Object.values(WS套接字对);
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
@@ -1589,7 +1615,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			}
 			if (已写入) continue;
 			if (上下文.首包已建立 && 上下文.目标主机 && 上下文.目标端口 > 0) {
-				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文);
+				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
 				continue;
 			}
 			const 明文数据 = 数据转Uint8Array(明文块);
@@ -1629,7 +1655,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			上下文.首包已建立 = true;
 			上下文.目标主机 = hostname;
 			上下文.目标端口 = port;
-			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文);
+			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
 		}
 	};
 
@@ -1681,7 +1707,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
 				return;
 			}
-			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 当前块字节 || 数据转Uint8Array(chunk));
+			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 当前块字节 || 数据转Uint8Array(chunk), 请求上下文);
 		} else {
 			判断是否是木马 = false;
 			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
@@ -1703,7 +1729,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
 				return forwardataudp(rawData, serverSock, respHeader, request);
 			}
-			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文);
+			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
 		}
 	};
 
@@ -2167,7 +2193,7 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 	return new Uint8Array(pt);
 }
 
-async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null, 仅建立连接 = false) {
+async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null, 仅建立连接 = false, 请求上下文 = null) {
 	const ctx反代IP = 反代上下文.反代IP || '';
 	const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
@@ -2177,7 +2203,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
-	const TCP连接 = 创建请求TCP连接器(request);
+	const TCP连接 = 请求上下文?.dial || 创建请求TCP连接器(request);
+	// Шаг 1.1: 并发拨号 берётся из RequestContext.settings (фолбэк — глобал для
+	// вызовов без контекста); cmcc-пин удалён — оператор не урезает до 1.
+	const 拨号并发数 = 请求上下文?.settings?.dialConcurrency ?? Math.max(1, TCP并发拨号数 | 0);
 	const 使用木马反代 = 允许木马反代 && (反代上下文.木马反代地址 || null);
 	const 木马反代目标 = 使用木马反代 ? 反代上下文.木马反代地址 : null;
 	const 木马反代握手数据 = 使用木马反代 ? 提取木马反代握手数据(木马反代首包数据, rawData) : null;
@@ -2277,7 +2306,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			const data = r.data;
 			return r.type === 28 && typeof data === 'string' && isIPHostname(data) ? [data] : [];
 		}))];
-		const 拨号上限 = Math.max(1, TCP并发拨号数 | 0);
+		const 拨号上限 = Math.max(1, 拨号并发数);
 		const ipList = ipv4List.length >= 拨号上限
 			? ipv4List.slice(0, 拨号上限)
 			: ipv4List.concat(ipv6List.slice(0, 拨号上限 - ipv4List.length));
@@ -2295,7 +2324,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectDirect(address, port, data = null, 启用预加载 = false) {
 		const 预加载候选列表 = 启用预加载 ? await 构建预加载竞速候选列表(address, port) : null;
-		const 候选列表 = 预加载候选列表 || Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
+		const 候选列表 = 预加载候选列表 || Array.from({ length: 拨号并发数 }, (_, attempt) => ({ hostname: address, port, attempt }));
 		log(预加载候选列表
 			? `[TCP直连] 并发尝试 ${候选列表.length} 路: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`
 			: `[TCP直连] 并发尝试 ${候选列表.length} 路: ${address}:${port}`);
