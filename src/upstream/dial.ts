@@ -1036,3 +1036,40 @@ export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认�
 	保存快照();
 	return 反代上下文;
 }
+export function 创建请求TCP连接器(request) {
+	const 请求对象 = /** @type {any} */ (request);
+	const fetcher = 请求对象?.fetcher;
+	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
+	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+}
+
+export async function 连接木马反代(首包数据, TCP连接, 木马反代目标) {
+	if (!木马反代目标) throw new Error('trojan fallback is not configured');
+	const socket = TCP连接({ hostname: stripIPv6Brackets(木马反代目标.hostname), port: 木马反代目标.port });
+	let writer = null;
+	try {
+		if (socket.opened) await socket.opened;
+		if (有效数据长度(首包数据) > 0) {
+			writer = socket.writable.getWriter();
+			await writer.write(数据转Uint8Array(首包数据));
+		}
+		return socket;
+	} catch (error) {
+		try { socket?.close?.() } catch (e) { }
+		throw error;
+	} finally {
+		try { writer?.releaseLock() } catch (e) { }
+	}
+}
+
+export function 提取木马反代握手数据(首包数据, rawData) {
+	const 首包 = 数据转Uint8Array(首包数据);
+	const payload = 数据转Uint8Array(rawData);
+	if (!payload.byteLength) return 首包;
+	const 握手长度 = 首包.byteLength - payload.byteLength;
+	if (握手长度 <= 0) return 首包;
+	for (let i = 0; i < payload.byteLength; i++) {
+		if (首包[握手长度 + i] !== payload[i]) return 首包;
+	}
+	return 首包.subarray(0, 握手长度);
+}
