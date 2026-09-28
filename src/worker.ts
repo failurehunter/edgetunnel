@@ -1149,6 +1149,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 请求�
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
+				canRetry: () => typeof remoteConnWrapper.canRetry首包 === 'function' ? remoteConnWrapper.canRetry首包() : true,
 				名称: 'gRPC上行'
 			});
 
@@ -1406,6 +1407,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, 请�
 			await remoteConnWrapper.retryConnect();
 		},
 		关闭连接: err => 处理WS显式传输错误(err),
+		canRetry: () => typeof remoteConnWrapper.canRetry首包 === 'function' ? remoteConnWrapper.canRetry首包() : true,
 		名称: 'WS上行'
 	});
 
@@ -2203,6 +2205,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	let 已通过代理发送首包 = false;
+	// Фаза 2: очередь опрашивает relay — replay только до отправки первого пакета.
+	if (remoteConnWrapper) remoteConnWrapper.canRetry首包 = () => !已通过代理发送首包;
 	const TCP连接 = 请求上下文?.dial || 创建请求TCP连接器(request);
 	// Шаг 1.1: 并发拨号 берётся из RequestContext.settings (фолбэк — глобал для
 	// вызовов без контекста); cmcc-пин удалён — оператор не урезает до 1.
@@ -2709,7 +2713,7 @@ function 创建上行Grain合包流(目标字节 = 上行合包目标字节) {
 	};
 }
 
-function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, 名称 = '上行队列' }) {
+export function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, canRetry = null, 名称 = '上行队列' }) {
 	const grain = 创建Grain收纳器(上行合包目标字节);
 	let draining = false;
 	let closed = false;
@@ -2780,7 +2784,11 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 					} catch (err) {
 						释放写入器?.();
 						if (closed) break;
-						if (!item.allowRetry || typeof 重试连接 !== 'function') throw err;
+						// Фаза 2 (реестр 1.1, строка 2): replay допустим только пока ни один
+						// байт не мог уйти — canRetry() от relay (по сути `!已通过代理发送首包`).
+						// Иначе — закрытие соединения, без дубликатов.
+						const 允许重试 = item.allowRetry && typeof 重试连接 === 'function' && (!canRetry || canRetry());
+						if (!允许重试) throw err;
 						await 重试连接();
 						if (closed) break;
 						writer = 获取写入器();
@@ -3053,7 +3061,7 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 	};
 }
 
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null) {
+export async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false, readError = null;
 	const BYOB单次读取上限 = 64 * 1024;
 	const 当前连接仍有效 = () => !isCurrentSocket || isCurrentSocket();
