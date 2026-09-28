@@ -5,32 +5,30 @@
 // Relay владеет 已通过代理发送首包 и поставляет canRetry() в очередь (фаза 2).
 // Лог → console (telemetry остаётся шагом 11).
 //
-// ИЗВЕСТНОЕ ОТКЛОНЕНИЕ (исправлено в шаге 10, config.ts): env-флаги изолята
-// 反代并发拨号数 / 预加载竞速拨号 / SOCKS5白名单 раньше жили в worker.ts. Чтобы не
-// заводить circular import (relay → worker), их владельцем стал relay.ts, а
-// worker.ts пишет их через 应用拨号环境() и читает 白名单 через 取SOCKS5白名单().
-// Значения и момент записи не изменились.
+// ИЗВЕСТНОЕ ОТКЛОНЕНИЕ (исправлено в шаге 3.10, config.ts): env-флаги изолята
+// 反代并发拨号数 / 预加载竞速拨号 раньше жили в worker.ts. Чтобы не заводить
+// circular import (relay → worker), их владельцем стал relay.ts, а worker.ts
+// пишет их через 应用拨号环境(). Значения и момент записи не изменились.
+// SOCKS5白名单 тоже переехал сюда в 3.8, но в 3.10 вернулся в config.ts
+// (это значение конфига, а не dial-настройка) — отсюда он импортируется.
 
 import { 有效数据长度, 数据转Uint8Array, isIPHostname, isIPv4 } from "../util";
 import { DoH查询, 解析地址端口 } from "../dns";
 import { 特征码字典 } from "../obfuscation-tokens";
 import { 创建请求TCP连接器, 连接木马反代, 提取木马反代握手数据, socks5Connect, httpConnect, httpsConnect, turnConnect, sstpConnect } from "../upstream/dial";
 import { 创建Grain收纳器, 下行Grain包字节, 下行Grain尾部阈值, 下行Grain低水位字节, 下行Grain最大等待轮次 } from "./grain";
+import { 取SOCKS5白名单 } from "../config";
 
 const log = (...args) => console.error('[relay]', ...args);
 
 // Флаги изолята, ранее объявленные в worker.ts (строка 16).
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
-let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 
-// Вызывается из fetch-обработчика worker.ts на прежнем месте (строки 63-64, 77).
+// Вызывается из fetch-обработчика worker.ts на прежнем месте (строки 63-64).
 export function 应用拨号环境(环境) {
 	预加载竞速拨号 = ['1', 'true'].includes(环境.PRELOAD_RACE_DIAL) || 预加载竞速拨号;
 	反代并发拨号数 = Math.max(1, Number(环境.PROXY_CONCURRENT_DIAL) || 反代并发拨号数);
-	if (环境.合并白名单) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(环境.合并白名单))];
 }
-
-export function 取SOCKS5白名单() { return SOCKS5白名单; }
 export function 失效TCP连接世代(remoteConnWrapper) {
 	if (!remoteConnWrapper) return;
 	remoteConnWrapper.generation = (Number.isInteger(remoteConnWrapper.generation) ? remoteConnWrapper.generation : 0) + 1;

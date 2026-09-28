@@ -1,14 +1,15 @@
 // @ts-nocheck
 // Фаза 3, Шаг 3.1: чистые утилиты вынесены функция-в-функцию в src/util.ts.
-import { 有效数据长度, 数据转Uint8Array, 拼接字节数据, formatIdentifier, stripIPv6Brackets, isIPHostname, isIPv4, 掩码敏感信息, MD5MD5 } from "./util";
+import { 有效数据长度, 数据转Uint8Array, 拼接字节数据, formatIdentifier, stripIPv6Brackets, isIPHostname, isIPv4, 掩码敏感信息, MD5MD5, 随机路径, 替换星号为随机字符, 获取传输路径参数值 } from "./util";
 import { 特征码字典, 汇聚订阅_UA } from "./obfuscation-tokens";
 import { ALERT_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, ALERT_UNRECOGNIZED_NAME, shouldIgnoreTlsAlert, CONNECT_TIMEOUT_MS, TURN_STUN_MAGIC_COOKIE, TURN_STUN_TYPE, TURN_STUN_ATTR, turnStunPadding, createTurnStunAttribute, createTurnStunMessage, readTurnStunMessage, writeTurnBytes, withTimeout, DoH查询, 整理成数组, 解析地址端口 } from "./dns";
 import { UUID字节缓存, 魏烈思文本解码器, 木马文本解码器, 解析木马请求, 读取十六进制半字节, 获取UUID字节, UUID字节匹配, 解析魏烈思请求, SS支持加密配置, SSAEAD标签长度, SSNonce长度, SS子密钥信息, SS文本编码器, SS文本解码器, SS主密钥缓存, SS递增Nonce计数器, SS派生主密钥, SS派生会话密钥, SSAEAD加密, SSAEAD解密, sha224 } from "./protocols";
 import { TlsClient } from "./tls";
 import { 解析木马反代地址, socks5Connect, httpConnect, httpsConnect, turnConnect, sstpConnect, base64SecretEncode, base64SecretDecode, 反代参数获取, 获取SOCKS5账号, 获取代理默认端口, 创建请求TCP连接器, 连接木马反代, 提取木马反代握手数据 } from "./upstream/dial";
 import { 创建Grain收纳器, 创建上行Grain合包流, 创建上行写入队列, 上行合包目标字节, 上行队列最大字节, 上行队列最大条目, 下行Grain包字节, 下行Grain尾部阈值, 下行Grain低水位字节, 下行Grain最大等待轮次 } from "./transport/grain";
-import { 失效TCP连接世代, 开始TCP连接世代, forwardataTCP, 创建下行Grain发送器, connectStreams, closeSocketQuietly, WebSocket发送并等待, 应用拨号环境, 取SOCKS5白名单 } from "./transport/relay";
+import { 失效TCP连接世代, 开始TCP连接世代, forwardataTCP, 创建下行Grain发送器, connectStreams, closeSocketQuietly, WebSocket发送并等待, 应用拨号环境 } from "./transport/relay";
 import { 转发木马UDP数据, 转发木马UDP反代数据, forwardataudp, isSpeedTestSite, 构造本地204响应, 构造WS本地204响应 } from "./transport/shared";
+import { 读取config_JSON, getCloudflareUsage, 应用白名单环境, 取SOCKS5白名单, 获取叉HTTPPadding标识, 获取传输协议配置 } from "./config";
 const Version = '2026-09-22 20:01:17';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -63,8 +64,8 @@ export default {
 		应用拨号环境({
 			PRELOAD_RACE_DIAL: env.PRELOAD_RACE_DIAL,
 			PROXY_CONCURRENT_DIAL: env.PROXY_CONCURRENT_DIAL,
-			合并白名单: env.GO2SOCKS5 ? await 整理成数组(env.GO2SOCKS5) : null,
 		});
+		if (env.GO2SOCKS5) 应用白名单环境(await 整理成数组(env.GO2SOCKS5));
 		// TCP并发拨号数 больше не пишется на уровне запроса (Шаг 1.1, реестр 1.1, строка 1);
 		// значение живёт в RequestContext.settings, см. parseSettings/创建请求上下文.
 		// Флаги 反代并发拨号数/预加载竞速拨号/白名单 живут в relay.ts (шаг 3.8) — пишем их
@@ -576,9 +577,6 @@ const HPACKHuffman码长 = [
 	30
 ];
 
-function 获取叉HTTPPadding标识(yourUUID) {
-	return { 头: yourUUID.slice(1, 7), 键: '_' + yourUUID.slice(25, 31) };
-}
 
 function 计算HPACKHuffman字节长度(字符串) {
 	const 字节 = new TextEncoder().encode(字符串);
@@ -1780,29 +1778,6 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, 请�
 	return new Response(null, { status: 101, webSocket: clientSock, headers: { 'Sec-WebSocket-Extensions': '' } });
 }
 
-function 获取传输协议配置(配置 = {}) {
-	const 是gRPC = 配置.传输协议 === 'grpc';
-	const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(配置.UUID);
-	const 叉混淆JSON = {
-		"xPaddingObfsMode": true,
-		"xPaddingMethod": "tokenish",
-		"xPaddingPlacement": "queryInHeader",
-		"xPaddingHeader": 本机Padding头,
-		"xPaddingKey": 本机Padding键
-	};
-	return {
-		type: 是gRPC ? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi' : 'grpc&mode=gun') : (配置.传输协议 === 'xhttp' ? `xhttp&mode=stream-one&extra=${encodeURIComponent(JSON.stringify(叉混淆JSON))}` : 'ws'),
-		路径字段名: 是gRPC ? 'serviceName' : 'path',
-		域名字段名: 是gRPC ? 'authority' : 'host'
-	};
-}
-
-function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优选订阅生成器 = false) {
-	const 路径值 = 作为优选订阅生成器 ? '/' : (配置.随机路径 ? 随机路径(节点路径) : 节点路径);
-	if (配置.传输协议 !== 'grpc') return 路径值;
-	return 路径值.split('?')[0] || '/';
-}
-
 function log(...args) {
 	if (调试日志打印) console.log(...args);
 }
@@ -2378,278 +2353,6 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 	} catch (error) { console.error(`日志记录失败: ${error.message}`) }
 }
 
-function 随机路径(完整节点路径 = "/") {
-	const 常用路径目录 = ["about", "account", "acg", "act", "activity", "ad", "ads", "ajax", "album", "albums", "anime", "api", "app", "apps", "archive", "archives", "article", "articles", "ask", "auth", "avatar", "bbs", "bd", "blog", "blogs", "book", "books", "bt", "buy", "cart", "category", "categories", "cb", "channel", "channels", "chat", "china", "city", "class", "classify", "clip", "clips", "club", "cn", "code", "collect", "collection", "comic", "comics", "community", "company", "config", "contact", "content", "course", "courses", "cp", "data", "detail", "details", "dh", "directory", "discount", "discuss", "dl", "dload", "doc", "docs", "document", "documents", "doujin", "download", "downloads", "drama", "edu", "en", "ep", "episode", "episodes", "event", "events", "f", "faq", "favorite", "favourites", "favs", "feedback", "file", "files", "film", "films", "forum", "forums", "friend", "friends", "game", "games", "gif", "go", "go.html", "go.php", "group", "groups", "help", "home", "hot", "htm", "html", "image", "images", "img", "index", "info", "intro", "item", "items", "ja", "jp", "jump", "jump.html", "jump.php", "jumping", "knowledge", "lang", "lesson", "lessons", "lib", "library", "link", "links", "list", "live", "lives", "m", "mag", "magnet", "mall", "manhua", "map", "member", "members", "message", "messages", "mobile", "movie", "movies", "music", "my", "new", "news", "note", "novel", "novels", "online", "order", "out", "out.html", "out.php", "outbound", "p", "page", "pages", "pay", "payment", "pdf", "photo", "photos", "pic", "pics", "picture", "pictures", "play", "player", "playlist", "post", "posts", "product", "products", "program", "programs", "project", "qa", "question", "rank", "ranking", "read", "readme", "redirect", "redirect.html", "redirect.php", "reg", "register", "res", "resource", "retrieve", "sale", "search", "season", "seasons", "section", "seller", "series", "service", "services", "setting", "settings", "share", "shop", "show", "shows", "site", "soft", "sort", "source", "special", "star", "stars", "static", "stock", "store", "stream", "streaming", "streams", "student", "study", "tag", "tags", "task", "teacher", "team", "tech", "temp", "test", "thread", "tool", "tools", "topic", "topics", "torrent", "trade", "travel", "tv", "txt", "type", "u", "upload", "uploads", "url", "urls", "user", "users", "v", "version", "videos", "view", "vip", "vod", "watch", "web", "wenku", "wiki", "work", "www", "zh", "zh-cn", "zh-tw", "zip"];
-	const 随机数 = Math.floor(Math.random() * 3 + 1);
-	const 随机路径 = 常用路径目录.sort(() => 0.5 - Math.random()).slice(0, 随机数).join('/');
-	if (完整节点路径 === "/") return `/${随机路径}`;
-	else return `/${随机路径 + 完整节点路径.replace('/?', '?')}`;
-}
-
-function 替换星号为随机字符(内容) {
-	if (typeof 内容 !== 'string' || !内容.includes('*')) return 内容;
-	const 字符集 = 'abcdefghijklmnopqrstuvwxyz0123456789';
-	return 内容.replace(/\*/g, () => {
-		let s = '';
-		for (let i = 0; i < Math.floor(Math.random() * 14) + 3; i++) s += 字符集[Math.floor(Math.random() * 字符集.length)];
-		return s;
-	});
-}
-
-async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
-	const _p = 特征码字典[0];
-	const host = hostname, Ali_DoH = "https://dns.alidns.com/dns-query", ECH_SNI = "cloudflare-ech.com", 占位符 = '{{IP:PORT}}', 初始化开始时间 = performance.now(), 默认配置JSON = {
-		TIME: new Date().toISOString(),
-		HOST: host,
-		HOSTS: [hostname],
-		UUID: userID,
-		PATH: "/",
-		ALPN: "",
-		协议类型: "v" + "le" + "ss",
-		传输协议: "ws",
-		gRPC模式: "gun",
-		gRPCUserAgent: UA,
-		跳过证书验证: false,
-		启用0RTT: false,
-		TLS分片: null,
-		随机路径: false,
-		ECH: false,
-		ECHConfig: {
-			DNS: Ali_DoH,
-			SNI: ECH_SNI,
-		},
-		SS: {
-			加密方式: "aes-128-gcm",
-			TLS: true,
-		},
-		Fingerprint: "chrome",
-		优选订阅生成: {
-			local: true, // true: 基于本地的优选地址  false: 优选订阅生成器
-			本地IP库: {
-				随机IP: true, // 当 随机IP 为true时生效，启用随机IP的数量，否则使用KV内的ADD.txt
-				随机数量: 16,
-				指定端口: -1,
-			},
-			SUB: null,
-			SUBNAME: "edge" + "tunnel",
-			SUBUpdateTime: 3, // 订阅更新时间（小时）
-			TOKEN: await MD5MD5(hostname + userID),
-		},
-		订阅转换配置: {
-			SUBAPI: `https://SUBAPI.${特征码字典[1]}ssss.net`,
-			SUBCONFIG: `https://raw.githubusercontent.com/${特征码字典[1]}/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Mini_MultiMode_CF.ini`,
-			SUBEMOJI: false,
-			SUBLIST: false, //仅输出节点信息
-			UDP: false, // 启用 UDP
-			XUDP: false, // 启用 XUDP
-			TLS13: false, // 启用 TLS 1.3
-			APPEND_TYPE: false, // 插入节点类型
-			SORT: false, // 基础节点排序
-			EXPAND: true, // 展开规则全文
-		},
-		反代: {
-			[_p]: "auto",
-			SOCKS5: {
-				启用: null,
-				全局: false,
-				账号: '',
-				白名单: 取SOCKS5白名单(),
-			},
-			路径模板: {
-				[_p]: "proxyip=" + 占位符,
-				SOCKS5: {
-					全局: "socks5://" + 占位符,
-					标准: "socks5=" + 占位符
-				},
-				HTTP: {
-					全局: "http://" + 占位符,
-					标准: "http=" + 占位符
-				},
-				HTTPS: {
-					全局: "https://" + 占位符,
-					标准: "https=" + 占位符
-				},
-				TURN: {
-					全局: "turn://" + 占位符,
-					标准: "turn=" + 占位符
-				},
-				SSTP: {
-					全局: "sstp://" + 占位符,
-					标准: "sstp=" + 占位符
-				},
-			},
-		},
-		TG: {
-			启用: false,
-			BotToken: null,
-			ChatID: null,
-		},
-		CF: {
-			Email: null,
-			GlobalAPIKey: null,
-			AccountID: null,
-			APIToken: null,
-			UsageAPI: null,
-			Usage: {
-				success: false,
-				pages: 0,
-				workers: 0,
-				total: 0,
-				max: 100000,
-			},
-		}
-	};
-
-	// Шаг 1.2: конфиг собирается в локальную переменную и возвращается наружу;
-	// module-global config_JSON больше не пишется (регресс бага #1 — два
-	// параллельных запроса с разными env не перезаписывают друг друга).
-	let config_JSON = 默认配置JSON;
-
-	try {
-		let configJSON = await env.KV.get('config.json');
-		if (!configJSON || 重置配置 == true) {
-			await env.KV.put('config.json', JSON.stringify(默认配置JSON, null, 2));
-			config_JSON = 默认配置JSON;
-		} else {
-			config_JSON = JSON.parse(configJSON);
-		}
-	} catch (error) {
-		console.error(`读取config_JSON出错: ${error.message}`);
-		config_JSON = 默认配置JSON;
-	}
-
-	if (!config_JSON.订阅转换配置.SUBLIST) config_JSON.订阅转换配置.SUBLIST = false;
-	if (!config_JSON.订阅转换配置.UDP) config_JSON.订阅转换配置.UDP = false;
-	if (!config_JSON.订阅转换配置.XUDP) config_JSON.订阅转换配置.XUDP = false;
-	if (!config_JSON.订阅转换配置.TLS13) config_JSON.订阅转换配置.TLS13 = false;
-	if (!config_JSON.订阅转换配置.APPEND_TYPE) config_JSON.订阅转换配置.APPEND_TYPE = false;
-	if (!config_JSON.订阅转换配置.SORT) config_JSON.订阅转换配置.SORT = false;
-	if (typeof config_JSON.订阅转换配置.EXPAND !== 'boolean') config_JSON.订阅转换配置.EXPAND = true;
-	if (!config_JSON.gRPCUserAgent) config_JSON.gRPCUserAgent = UA;
-	config_JSON.HOST = host;
-	if (!config_JSON.HOSTS) config_JSON.HOSTS = [hostname];
-	if (env.HOST) config_JSON.HOSTS = (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]);
-	config_JSON.UUID = userID;
-	if (!config_JSON.随机路径) config_JSON.随机路径 = false;
-	if (!config_JSON.启用0RTT) config_JSON.启用0RTT = false;
-
-	if (env.PATH) config_JSON.PATH = env.PATH.startsWith('/') ? env.PATH : '/' + env.PATH;
-	else if (!config_JSON.PATH) config_JSON.PATH = '/';
-	if (!config_JSON.ALPN) config_JSON.ALPN = "";
-
-	if (!config_JSON.gRPC模式) config_JSON.gRPC模式 = 'gun';
-	if (!config_JSON.SS) config_JSON.SS = { 加密方式: "aes-128-gcm", TLS: false };
-
-	if (!config_JSON.反代.路径模板?.[_p]) {
-		config_JSON.反代.路径模板 = {
-			[_p]: "proxyip=" + 占位符,
-			SOCKS5: {
-				全局: "socks5://" + 占位符,
-				标准: "socks5=" + 占位符
-			},
-			HTTP: {
-				全局: "http://" + 占位符,
-				标准: "http=" + 占位符
-			},
-			HTTPS: {
-				全局: "https://" + 占位符,
-				标准: "https=" + 占位符
-			},
-			TURN: {
-				全局: "turn://" + 占位符,
-				标准: "turn=" + 占位符
-			},
-			SSTP: {
-				全局: "sstp://" + 占位符,
-				标准: "sstp=" + 占位符
-			},
-		};
-	}
-	if (!config_JSON.反代.路径模板.HTTPS) config_JSON.反代.路径模板.HTTPS = { 全局: "https://" + 占位符, 标准: "https=" + 占位符 };
-	if (!config_JSON.反代.路径模板.TURN) config_JSON.反代.路径模板.TURN = { 全局: "turn://" + 占位符, 标准: "turn=" + 占位符 };
-	if (!config_JSON.反代.路径模板.SSTP) config_JSON.反代.路径模板.SSTP = { 全局: "sstp://" + 占位符, 标准: "sstp=" + 占位符 };
-
-	const 代理配置 = config_JSON.反代.路径模板[config_JSON.反代.SOCKS5.启用?.toUpperCase()];
-
-	let 路径反代参数 = '';
-	if (代理配置 && config_JSON.反代.SOCKS5.账号) 路径反代参数 = (config_JSON.反代.SOCKS5.全局 ? 代理配置.全局 : 代理配置.标准).replace(占位符, config_JSON.反代.SOCKS5.账号);
-	else if (config_JSON.反代[_p] !== 'auto') 路径反代参数 = config_JSON.反代.路径模板[_p].replace(占位符, config_JSON.反代[_p]);
-
-	let 反代查询参数 = '';
-	if (路径反代参数.includes('?')) {
-		const [反代路径部分, 反代查询部分] = 路径反代参数.split('?');
-		路径反代参数 = 反代路径部分;
-		反代查询参数 = 反代查询部分;
-	}
-
-	config_JSON.PATH = config_JSON.PATH.replace(路径反代参数, '').replace('//', '/');
-	const normalizedPath = config_JSON.PATH === '/' ? '' : config_JSON.PATH.replace(/\/+(?=\?|$)/, '').replace(/\/+$/, '');
-	const [路径部分, ...查询数组] = normalizedPath.split('?');
-	const 查询部分 = 查询数组.length ? '?' + 查询数组.join('?') : '';
-	const 最终查询部分 = 反代查询参数 ? (查询部分 ? 查询部分 + '&' + 反代查询参数 : '?' + 反代查询参数) : 查询部分;
-	config_JSON.完整节点路径 = (路径部分 || '/') + (路径部分 && 路径反代参数 ? '/' : '') + 路径反代参数 + 最终查询部分 + (config_JSON.启用0RTT ? (最终查询部分 ? '&' : '?') + 'ed=2560' : '');
-
-	if (!config_JSON.TLS分片 && config_JSON.TLS分片 !== null) config_JSON.TLS分片 = null;
-	const TLS分片参数 = config_JSON.TLS分片 == 'Shadowrocket' ? `&fragment=${encodeURIComponent('1,40-60,30-50,tlshello')}` : config_JSON.TLS分片 == 'Happ' ? `&fragment=${encodeURIComponent('3,1,tlshello')}` : '';
-	if (!config_JSON.Fingerprint) config_JSON.Fingerprint = "chrome";
-	if (!config_JSON.ECH) config_JSON.ECH = false;
-	if (!config_JSON.ECHConfig) config_JSON.ECHConfig = { DNS: Ali_DoH, SNI: ECH_SNI };
-	const ECHLINK参数 = config_JSON.ECH ? `&ech=${encodeURIComponent((config_JSON.ECHConfig.SNI ? config_JSON.ECHConfig.SNI + '+' : '') + config_JSON.ECHConfig.DNS)}` : '';
-	const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
-	const 传输路径参数值 = 获取传输路径参数值(config_JSON, config_JSON.完整节点路径);
-	config_JSON.LINK = config_JSON.协议类型 === 'ss'
-		? `${config_JSON.协议类型}://${btoa(config_JSON.SS.加密方式 + ':' + userID)}@${host}:${config_JSON.SS.TLS ? '443' : '80'}?plugin=v2${encodeURIComponent(`ray-plugin;mode=websocket;host=${host};path=${((config_JSON.完整节点路径.includes('?') ? config_JSON.完整节点路径.replace('?', '?enc=' + config_JSON.SS.加密方式 + '&') : (config_JSON.完整节点路径 + '?enc=' + config_JSON.SS.加密方式)) + (config_JSON.SS.TLS ? ';tls' : ''))};mux=0`) + ECHLINK参数}#${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`
-		: `${config_JSON.协议类型}://${userID}@${host}:443?security=tls&type=${传输协议 + ECHLINK参数}&${域名字段名}=${host}&fp=${config_JSON.Fingerprint}&sni=${host}&${路径字段名}=${encodeURIComponent(传输路径参数值) + TLS分片参数}&encryption=none#${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
-	config_JSON.优选订阅生成.TOKEN = await MD5MD5(hostname + userID);
-
-	const 初始化TG_JSON = { BotToken: null, ChatID: null };
-	config_JSON.TG = { 启用: config_JSON.TG.启用 ? config_JSON.TG.启用 : false, ...初始化TG_JSON };
-	try {
-		const TG_TXT = await env.KV.get('tg.json');
-		if (!TG_TXT) {
-			await env.KV.put('tg.json', JSON.stringify(初始化TG_JSON, null, 2));
-		} else {
-			const TG_JSON = JSON.parse(TG_TXT);
-			config_JSON.TG.ChatID = TG_JSON.ChatID ? TG_JSON.ChatID : null;
-			config_JSON.TG.BotToken = TG_JSON.BotToken ? 掩码敏感信息(TG_JSON.BotToken) : null;
-		}
-	} catch (error) {
-		console.error(`读取tg.json出错: ${error.message}`);
-	}
-
-	const 初始化CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
-	config_JSON.CF = { ...初始化CF_JSON, Usage: { success: false, pages: 0, workers: 0, total: 0, max: 100000 } };
-	try {
-		const CF_TXT = await env.KV.get('cf.json');
-		if (!CF_TXT) {
-			await env.KV.put('cf.json', JSON.stringify(初始化CF_JSON, null, 2));
-		} else {
-			const CF_JSON = JSON.parse(CF_TXT);
-			if (CF_JSON.UsageAPI) {
-				try {
-					const response = await fetch(CF_JSON.UsageAPI);
-					const Usage = await response.json();
-					config_JSON.CF.Usage = Usage;
-				} catch (err) {
-					console.error(`请求 CF_JSON.UsageAPI 失败: ${err.message}`);
-				}
-			} else {
-				config_JSON.CF.Email = CF_JSON.Email ? CF_JSON.Email : null;
-				config_JSON.CF.GlobalAPIKey = CF_JSON.GlobalAPIKey ? 掩码敏感信息(CF_JSON.GlobalAPIKey) : null;
-				config_JSON.CF.AccountID = CF_JSON.AccountID ? 掩码敏感信息(CF_JSON.AccountID) : null;
-				config_JSON.CF.APIToken = CF_JSON.APIToken ? 掩码敏感信息(CF_JSON.APIToken) : null;
-				config_JSON.CF.UsageAPI = null;
-				const Usage = await getCloudflareUsage(CF_JSON.Email, CF_JSON.GlobalAPIKey, CF_JSON.AccountID, CF_JSON.APIToken);
-				config_JSON.CF.Usage = Usage;
-			}
-		}
-	} catch (error) {
-		console.error(`读取cf.json出错: ${error.message}`);
-	}
-
-	config_JSON.加载时间 = (performance.now() - 初始化开始时间).toFixed(2) + 'ms';
-	return config_JSON;
-}
 
 function 识别运营商(request) {
 	const cf = request?.cf;
@@ -2966,67 +2669,6 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 	// 将LINK内容转换为数组并去重
 	const LINK数组 = 订阅链接响应的明文LINK内容.trim() ? [...new Set(订阅链接响应的明文LINK内容.split(/\r?\n/).filter(line => line.trim() !== ''))] : [];
 	return [Array.from(results), LINK数组, 需要订阅转换订阅URLs, Array.from(反代IP池)];
-}
-
-
-
-
-async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
-	const API = "https://api.cloudflare.com/client/v4";
-	const sum = (a) => a?.reduce((t, i) => t + (i?.sum?.requests || 0), 0) || 0;
-	const cfg = { "Content-Type": "application/json" };
-
-	try {
-		if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
-
-		if (!AccountID) {
-			const r = await fetch(`${API}/accounts`, {
-				method: "GET",
-				headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
-			});
-			if (!r.ok) throw new Error(`账户获取失败: ${r.status}`);
-			const d = await r.json();
-			if (!d?.result?.length) throw new Error("未找到账户");
-			const idx = d.result.findIndex(a => a.name?.toLowerCase().startsWith(Email.toLowerCase()));
-			AccountID = d.result[idx >= 0 ? idx : 0]?.id;
-		}
-
-		const now = new Date();
-		now.setUTCHours(0, 0, 0, 0);
-		const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
-
-		const res = await fetch(`${API}/graphql`, {
-			method: "POST",
-			headers: hdr,
-			body: JSON.stringify({
-				query: `query getBillingMetrics($AccountID: String!, $filter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
-					viewer { accounts(filter: {accountTag: $AccountID}) {
-						pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $filter) { sum { requests } }
-						workersInvocationsAdaptive(limit: 10000, filter: $filter) { sum { requests } }
-					} }
-				}`,
-				variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } }
-			})
-		});
-
-		if (!res.ok) throw new Error(`查询失败: ${res.status}`);
-		const result = await res.json();
-		if (result.errors?.length) throw new Error(result.errors[0].message);
-
-		const acc = result?.data?.viewer?.accounts?.[0];
-		if (!acc) throw new Error("未找到账户数据");
-
-		const pages = sum(acc.pagesFunctionsInvocationsAdaptiveGroups);
-		const workers = sum(acc.workersInvocationsAdaptive);
-		const total = pages + workers;
-		const max = 100000;
-		log(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
-		return { success: true, pages, workers, total, max };
-
-	} catch (error) {
-		console.error('获取使用量错误:', error.message);
-		return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
-	}
 }
 
 async function nginx() {
