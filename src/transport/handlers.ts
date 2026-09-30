@@ -159,7 +159,21 @@ export async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {
 
 	let socket;
 	try {
-		socket = await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, 占位WS, 首包.respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, 首包.协议 === 'trojan', 首包.原始数据, true, 请求上下文);
+		socket = await forwardataTCP({
+			host: 首包.hostname,
+			portNum: 首包.port,
+			rawData: 首包.rawData,
+			ws: 占位WS,
+			respHeader: 首包.respHeader,
+			remoteConnWrapper: remoteConnWrapper,
+			yourUUID: yourUUID,
+			request: request,
+			反代上下文: 反代上下文,
+			允许木马反代: 首包.协议 === 'trojan',
+			木马反代首包数据: 首包.原始数据,
+			仅建立连接: true,
+			请求上下文: 请求上下文,
+			});
 	} catch (err) {
 		log(`[叉HTTP-Pipe] 连接失败: ${err?.message || err}`);
 		清理(err);
@@ -704,8 +718,22 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 									if (木马UDP上下文.反代地址) await 转发木马UDP数据(首包bytes, grpcBridge, 木马UDP上下文, request);
 									else if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
 								} else {
-									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 首包bytes, 请求上下文);
-								}
+									await forwardataTCP({
+										host: hostname,
+										portNum: port,
+										rawData: rawClientData,
+										ws: grpcBridge,
+										respHeader: null,
+										remoteConnWrapper: remoteConnWrapper,
+										yourUUID: yourUUID,
+										request: request,
+										反代上下文: 反代上下文,
+										允许木马反代: true,
+										木马反代首包数据: 首包bytes,
+										仅建立连接: false,
+										请求上下文: 请求上下文,
+									});
+							}
 							} else {
 								判断是否是木马 = false;
 								const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
@@ -727,7 +755,21 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
 									else await forwardataudp(rawData, grpcBridge, null, request);
 								}
-								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
+								else await forwardataTCP({
+									host: hostname,
+									portNum: port,
+									rawData: rawData,
+									ws: grpcBridge,
+									respHeader: null,
+									remoteConnWrapper: remoteConnWrapper,
+									yourUUID: yourUUID,
+									request: request,
+									反代上下文: 反代上下文,
+									允许木马反代: false,
+									木马反代首包数据: null,
+									仅建立连接: false,
+									请求上下文: 请求上下文,
+									});
 							}
 						}
 					}
@@ -1102,7 +1144,21 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 			}
 			if (已写入) continue;
 			if (上下文.首包已建立 && 上下文.目标主机 && 上下文.目标端口 > 0) {
-				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
+				await forwardataTCP({
+					host: 上下文.目标主机,
+					portNum: 上下文.目标端口,
+					rawData: 明文块,
+					ws: 上下文.回包Socket,
+					respHeader: null,
+					remoteConnWrapper: remoteConnWrapper,
+					yourUUID: yourUUID,
+					request: request,
+					反代上下文: 反代上下文,
+					允许木马反代: false,
+					木马反代首包数据: null,
+					仅建立连接: false,
+					请求上下文: 请求上下文,
+					});
 				continue;
 			}
 			const 明文数据 = 数据转Uint8Array(明文块);
@@ -1142,7 +1198,21 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 			上下文.首包已建立 = true;
 			上下文.目标主机 = hostname;
 			上下文.目标端口 = port;
-			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
+			await forwardataTCP({
+				host: hostname,
+				portNum: port,
+				rawData: rawClientData,
+				ws: 上下文.回包Socket,
+				respHeader: null,
+				remoteConnWrapper: remoteConnWrapper,
+				yourUUID: yourUUID,
+				request: request,
+				反代上下文: 反代上下文,
+				允许木马反代: false,
+				木马反代首包数据: null,
+				仅建立连接: false,
+				请求上下文: 请求上下文,
+				});
 		}
 	};
 
@@ -1194,7 +1264,21 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
 				return;
 			}
-			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 当前块字节 || 数据转Uint8Array(chunk), 请求上下文);
+			await forwardataTCP({
+				host: hostname,
+				portNum: port,
+				rawData: rawClientData,
+				ws: serverSock,
+				respHeader: null,
+				remoteConnWrapper: remoteConnWrapper,
+				yourUUID: yourUUID,
+				request: request,
+				反代上下文: 反代上下文,
+				允许木马反代: true,
+				木马反代首包数据: 当前块字节 || 数据转Uint8Array(chunk),
+				仅建立连接: false,
+				请求上下文: 请求上下文,
+				});
 		} else {
 			判断是否是木马 = false;
 			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
@@ -1216,7 +1300,21 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
 				return forwardataudp(rawData, serverSock, respHeader, request);
 			}
-			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, 请求上下文);
+			await forwardataTCP({
+				host: hostname,
+				portNum: port,
+				rawData: rawData,
+				ws: serverSock,
+				respHeader: respHeader,
+				remoteConnWrapper: remoteConnWrapper,
+				yourUUID: yourUUID,
+				request: request,
+				反代上下文: 反代上下文,
+				允许木马反代: false,
+				木马反代首包数据: null,
+				仅建立连接: false,
+				请求上下文: 请求上下文,
+				});
 		}
 	};
 

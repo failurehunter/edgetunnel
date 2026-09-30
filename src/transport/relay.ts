@@ -72,7 +72,21 @@ export async function WebSocket发送并等待(webSocket, payload) {
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
 }
 
-export async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null, 仅建立连接 = false, 请求上下文 = null) {
+export async function forwardataTCP({
+	host,
+	portNum,
+	rawData,
+	ws,
+	respHeader,
+	remoteConnWrapper,
+	yourUUID,
+	request = null,
+	反代上下文 = {},
+	允许木马反代 = false,
+	木马反代首包数据 = null,
+	仅建立连接 = false,
+	请求上下文 = null,
+}) {
 	const ctx反代IP = 反代上下文.反代IP || '';
 	const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
