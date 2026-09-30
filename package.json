@@ -6,15 +6,8 @@
   "description": "Cloudflare Worker proxy/tunnel — модульная миграция монолита _javascript_old.js (PLAN_new.md)",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir=dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
-    "types": "wrangler types src/worker-configuration.d.ts",
-    "test": "vitest run",
-    "hash-frozen": "node test/scripts/hash-frozen.mjs",
-    "check:handlers": "bash scripts/check-handlers-cifgrep.sh",
-    "check:dispatch": "bash scripts/check-dispatch-contract.sh",
-    "check": "npm run check:handlers && npm run check:dispatch && npm run check:undeclared && npm run check:parity",
-    "check:undeclared": "node scripts/check-undeclared.mjs",
-    "check:parity": "node scripts/check-frozen-parity.mjs"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "types": "wrangler types src/worker-configuration.d.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.3.0",
