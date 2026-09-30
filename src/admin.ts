@@ -131,6 +131,7 @@ return new Response(JSON.stringify(检测代理响应, null, 2), { status: 200, 
 // Маршруты login / admin/* / logout. Извлечены из fetch-обработчика монолита
 // (строки 123-268) на финальной сборке, шаг 3.16. Ветка, не нашедшая себя,
 // ничего не возвращает — вызывающий тогда продолжает цепочку маршрутов, как в монолите.
+/** @returns {import('./dispatch-contract').МаршрутОтвет} null, если ни одна ветка не нашла себя. */
 export async function 处理管理路由(env, request, ctx, url, host, userID, UA, 访问IP, 访问路径, 区分大小写访问路径, 管理员密码, 加密秘钥, Pages静态页面) {
 	if (访问路径 === 'login') {//处理登录页面和登录请求
 		const cookies = request.headers.get('Cookie') || '';
@@ -278,12 +279,14 @@ export async function 处理管理路由(env, request, ctx, url, host, userID, U
 		const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 		响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 		return 响应;
-}	// конец ветки logout
+	}	// конец ветки logout
+	return null;   // контракт диспетчера: «не моё» — строго null (src/dispatch-contract.ts)
 }
 
 
 // /locations: отдаёт список colo через speed.cloudflare.com, только при валидной
 // auth-cookie. Без неё ветка ничего не возвращает — цепочка маршрутов продолжается.
+/** @returns {import('./dispatch-contract').МаршрутОтвет} null без валидной auth-cookie. */
 export async function 处理Locations路由(request, UA, 加密秘钥, 管理员密码) {
 	const cookies = request.headers.get('Cookie') || '';
 	const authCookie = 读取AuthCookie(cookies);

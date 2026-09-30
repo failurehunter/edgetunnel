@@ -853,6 +853,7 @@ export async function 请求优选API(urls, 默认端口 = '443', 超时时间 =
 // Маршрут /sub. Извлечён из fetch-обработчика монолита на финальной сборке,
 // шаг 3.16: конвертеры и загрузка preferred-IP уже живут в этом модуле, и оставлять
 // сам маршрут в worker.ts означало бы, что подписка размазана по двум файлам.
+/** @returns {import('./dispatch-contract').МаршрутОтвет} null, если ветка не обслужила запрос. */
 export async function 处理订阅请求(request, env, ctx, url, host, userID, UA, 访问IP) {
 	const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
 	const 请求TOKEN = url.searchParams.get('token');
@@ -1046,10 +1047,12 @@ export async function 处理订阅请求(request, env, ctx, url, host, userID, U
 		}
 		return new Response(订阅内容, { status: 200, headers: responseHeaders });
 	}
+	return null;   // контракт диспетчера: «не моё» — строго null (src/dispatch-contract.ts)
 }
 
 // Быстрый вход в подписку: путь == KEY → редирект на /sub с подставленным token.
 // Извлечено из fetch-диспетчера на финальной сборке, шаг 3.16.
+/** @returns {import('./dispatch-contract').МаршрутОтвет} null, если путь не равен KEY. */
 export async function 快速订阅重定向(url, host, userID, 加密秘钥, 区分大小写访问路径) {
 	if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {
 		const params = new URLSearchParams(url.search);

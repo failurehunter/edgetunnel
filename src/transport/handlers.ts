@@ -451,6 +451,64 @@ export async function 读取叉HTTP首包(reader, token) {
 	return null;
 }
 ///////////////////////////////////////////////////////////////////////gRPC传输数据///////////////////////////////////////////////
+// ─────────────────────────────────────────────────────────────────────────────
+// Чистые автоматы кадрирования gRPC.
+//
+// Вынесены 2026-09-30 (план §Детали, шаг 3.16 не требовал, но пункт «проверить,
+// нет ли внутри чистых автоматов» — да): varint-кодирование/разбор и разбор
+// 5-байтового заголовка кадра не зависят ни от сокета, ни от reader'а, а были
+// вклеены прямо в 处理gRPC请求 и не имели тестов — тест шага 3.15 проверял
+// СВОЮ реимплементацию в файле теста, то есть production-код не покрывал вовсе.
+// Тела перенесены дословно, поведение не меняется.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** varint по gRPC/HTTP2: младшие 7 бит в байт, старший бит — «есть продолжение». */
+export function 编码gRPCVarint(число) {
+	const байты = [];
+	let remaining = число >>> 0;
+	while (remaining > 127) {
+		байты.push((remaining & 0x7f) | 0x80);
+		remaining >>>= 7;
+	}
+	байты.push(remaining);
+	return new Uint8Array(байты);
+}
+
+/**
+ * Возвращает длину varint-префикса в начале payload, либо 0, если префикса нет.
+ * Монолит начинал разбор с `payload[0] === 0x0a`; здесь условие вынесено наружу,
+ * чтобы вызывающий не дублировал его (в инлайн-коде это был `if (payload[0] === 0x0a)`).
+ */
+export function 解析gRPCVarint前缀(payload) {
+	if (payload.byteLength < 2 || payload[0] !== 0x0a) return 0;
+	let shift = 0;
+	let offset = 1;
+	let varint有效 = false;
+	while (offset < payload.length) {
+		const current = payload[offset++];
+		if ((current & 0x80) === 0) {
+			varint有效 = true;
+			break;
+		}
+		shift += 7;
+		if (shift > 35) break;
+	}
+	return varint有效 ? offset : 0;
+}
+
+/**
+ * Снимает очередной кадр из буфера.
+ * @returns {{grpcPayload: Uint8Array, rest: Uint8Array, frameSize: number} | null}
+ *   null — данных пока не хватает, ждём ещё.
+ */
+export function 拆解gRPC帧(pending) {
+	if (pending.byteLength < 5) return null;
+	const grpcLen = ((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4];
+	const frameSize = 5 + grpcLen;
+	if (pending.byteLength < frameSize) return null;
+	return { grpcPayload: pending.subarray(5, frameSize), rest: pending.slice(frameSize), frameSize };
+}
+
 export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 请求上下文 = null) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
@@ -485,14 +543,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 				send(data) {
 					if (已关闭) return;
 					const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
-					const lenBytes数组 = [];
-					let remaining = chunk.byteLength >>> 0;
-					while (remaining > 127) {
-						lenBytes数组.push((remaining & 0x7f) | 0x80);
-						remaining >>>= 7;
-					}
-					lenBytes数组.push(remaining);
-					const lenBytes = new Uint8Array(lenBytes数组);
+					const lenBytes = 编码gRPCVarint(chunk.byteLength);
 					const protobufLen = 1 + lenBytes.length + chunk.byteLength;
 					const frame = new Uint8Array(5 + protobufLen);
 					frame[0] = 0;
@@ -617,29 +668,15 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 					merged.set(pending, 0);
 					merged.set(当前块, pending.length);
 					pending = merged;
-					while (pending.byteLength >= 5) {
-						const grpcLen = ((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4];
-						const frameSize = 5 + grpcLen;
-						if (pending.byteLength < frameSize) break;
-						const grpcPayload = pending.subarray(5, frameSize);
-						pending = pending.slice(frameSize);
+					for (;;) {
+						const 帧 = 拆解gRPC帧(pending);
+						if (!帧) break;
+						const grpcPayload = 帧.grpcPayload;
+						pending = 帧.rest;
 						if (!grpcPayload.byteLength) continue;
 						let payload = grpcPayload;
-						if (payload.byteLength >= 2 && payload[0] === 0x0a) {
-							let shift = 0;
-							let offset = 1;
-							let varint有效 = false;
-							while (offset < payload.length) {
-								const current = payload[offset++];
-								if ((current & 0x80) === 0) {
-									varint有效 = true;
-									break;
-								}
-								shift += 7;
-								if (shift > 35) break;
-							}
-							if (varint有效) payload = payload.subarray(offset);
-						}
+						const varintСдвиг = 解析gRPCVarint前缀(payload);
+						if (varintСдвиг) payload = payload.subarray(varintСдвиг);
 						if (!payload.byteLength) continue;
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
