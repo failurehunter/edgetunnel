@@ -9,7 +9,7 @@
 // 解析木马请求/解析魏烈思请求 ошибка не проявлялась — и упала в проде на
 // VLESS-over-WS: «数据转Uint8Array is not defined».
 // Это прямой пример пробела §7b: транспортный слой не покрыт дифф-фикстурами.
-import { 数据转Uint8Array } from "./util";
+import { 数据转Uint8Array, 拼接字节数据 } from "./util";
 
 export const UUID字节缓存 = new Map();
 export const 魏烈思文本解码器 = new TextDecoder();

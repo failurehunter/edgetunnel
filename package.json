@@ -12,7 +12,9 @@
     "hash-frozen": "node test/scripts/hash-frozen.mjs",
     "check:handlers": "bash scripts/check-handlers-cifgrep.sh",
     "check:dispatch": "bash scripts/check-dispatch-contract.sh",
-    "check": "npm run check:handlers && npm run check:dispatch"
+    "check": "npm run check:handlers && npm run check:dispatch && npm run check:undeclared && npm run check:parity",
+    "check:undeclared": "node scripts/check-undeclared.mjs",
+    "check:parity": "node scripts/check-frozen-parity.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.3.0",

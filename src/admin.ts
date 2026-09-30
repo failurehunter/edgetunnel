@@ -14,9 +14,9 @@
 //     не блокируя миграцию, но зафиксировав в issue-трекере. Здесь переносится
 //     без изменений.
 
-import { MD5MD5, isIPHostname, 拼接字节数据, 获取传输协议配置 } from "./util";
-import { 读取config_JSON } from "./config";
-import { 识别运营商 } from "./subscription";
+import { MD5MD5, isIPHostname, 拼接字节数据 } from "./util";
+import { 读取config_JSON, getCloudflareUsage, 获取传输协议配置 } from "./config";
+import { 识别运营商, 请求优选API, 生成随机IP } from "./subscription";
 import { 请求日志记录 } from "./telemetry";
 import {
 	获取SOCKS5账号,

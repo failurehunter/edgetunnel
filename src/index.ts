@@ -6,11 +6,11 @@ const ECHO_PORT = 28333;
 
 // cf-мок для проброса в монолит (SELF-запросы cf не несут).
 const SPIKE_CF = {
-	colo: "HKG",
-	asn: 45102,
-	country: "HK",
-	city: "Hong Kong",
-	asOrganization: "Example-ISP",
+	colo: "WAW",
+	asn: 16276,
+	country: "PL",
+	city: "Warsaw",
+	asOrganization: "OVH Sp. z o. o.",
 };
 
 function json(x: unknown): Response {

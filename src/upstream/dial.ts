@@ -3,10 +3,23 @@
 // from worker.ts — function-in-function, behavior preserved.
 // Лог → console. TlsClient/textEncoder/textDecoder — из tls.ts.
 
-import { textEncoder, textDecoder } from "../tls";
-import { TlsClient } from "../tls";
-import { 有效数据长度, 拼接字节数据, 数据转Uint8Array, isIPHostname, stripIPv6Brackets } from "../util";
+import { textEncoder, textDecoder, TlsClient } from "../tls";
+import { 有效数据长度, 拼接字节数据, 数据转Uint8Array, isIPHostname, isIPv4, stripIPv6Brackets } from "../util";
 import { DoH查询 } from "../dns";
+import {
+	CONNECT_TIMEOUT_MS,
+	TURN_STUN_MAGIC_COOKIE,
+	TURN_STUN_TYPE,
+	TURN_STUN_ATTR,
+	createTurnStunAttribute,
+	createTurnStunMessage,
+	readTurnStunMessage,
+	writeTurnBytes,
+	withTimeout,
+	randomTurnTransactionId,
+	addTurnMessageIntegrity,
+	parseTurnErrorCode,
+} from "./turn";
 
 export const log = (...args) => console.error('[dial]', ...args);
 
