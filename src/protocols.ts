@@ -2,6 +2,14 @@
 // Фаза 3, Шаг 3.4: парсинг VLESS/Trojan/SS + SS-автоматы (чистые).
 // from worker.ts — function-in-function, behavior preserved.
 // Кэши (UUID字节缓存, SS主密钥缓存) — module-scope, живут до холодного старта.
+//
+// Шаг 3.4 (исправление 2026-09-30): 数据转Uint8Array ЗДЕСЬ НЕ БЫЛ ИМПОРТИРОВАН.
+// Модуль собирался из вырезки worker.ts, где этот символ жил на уровне worker,
+// поэтому локально он не был виден. Под @ts-nocheck и без единого теста на
+// 解析木马请求/解析魏烈思请求 ошибка не проявлялась — и упала в проде на
+// VLESS-over-WS: «数据转Uint8Array is not defined».
+// Это прямой пример пробела §7b: транспортный слой не покрыт дифф-фикстурами.
+import { 数据转Uint8Array } from "./util";
 
 export const UUID字节缓存 = new Map();
 export const 魏烈思文本解码器 = new TextDecoder();
