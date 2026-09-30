@@ -33,3 +33,20 @@ Thumbs.db
 
 # ── локальные заметки (не часть проекта) ───────────────────────────────
 *.local
+
+# ── не публикуется в форке (добавлено 2026-09-30) ──────────────────────
+# ВНИМАНИЕ: правила .gitignore действуют ТОЛЬКО на неотслеживаемые файлы.
+# Перечисленное ниже уже было закоммичено и запушено в ветку dev, поэтому
+# сами по себе эти правила ничего не убирают из репозитория. Чтобы файлы
+# действительно исчезли из индекса, нужно additionally:
+#     git rm --cached -r wrangler.toml test scripts
+#     git rm --cached PLAN_new.md docs/legacy-router-contract.md
+#     git commit -m "..."
+# После этого в клоне останутся незапушенные копии, и следующие команды
+# начнут падать: `npm run typecheck` (tsc -p test/tsconfig.json), `npm test`
+# (нет файлов), `npm run check` и `npm run hash-frozen` (нет scripts/).
+
+wrangler.toml
+*.md
+test/
+scripts/
