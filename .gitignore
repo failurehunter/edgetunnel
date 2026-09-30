@@ -47,6 +47,7 @@ Thumbs.db
 # (нет файлов), `npm run check` и `npm run hash-frozen` (нет scripts/).
 
 wrangler.toml
+wrangler.test.toml
 *.md
 test/
 scripts/
