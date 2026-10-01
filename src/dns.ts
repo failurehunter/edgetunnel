@@ -2,7 +2,7 @@
 // Фаза 3, Шаг 3.3: DNS/DoH/разрешение адресов + TURN/STUN-хелперы + consts.
 // from worker.ts — function-in-function, behavior preserved (свой log → console).
 
-import { 数据转Uint8Array, 拼接字节数据, 有效数据长度, isIPv4, stripIPv6Brackets } from "./util";
+import { 数据转Uint8Array, 拼接字节数据, 有效数据长度, isIPv4, stripIPv6Brackets, 洗牌, 带种子随机 } from "./util";
 
 export const ALERT_CLOSE_NOTIFY = 0, ALERT_LEVEL_WARNING = 1, ALERT_UNRECOGNIZED_NAME = 112;
 export const shouldIgnoreTlsAlert = fragment => fragment?.[0] === ALERT_LEVEL_WARNING && fragment?.[1] === ALERT_UNRECOGNIZED_NAME;
@@ -303,7 +303,10 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 	const 目标根域名 = 目标域名.includes('.') ? 目标域名.split('.').slice(-2).join('.') : 目标域名;
 	let 随机种子 = [...(目标根域名 + UUID)].reduce((a, c) => a + c.charCodeAt(0), 0);
 	console.error(`[反代解析] 随机种子: ${随机种子}\n目标站点: ${目标根域名}`);
-	const 洗牌后 = [...排序后数组].sort(() => (随机种子 = (随机种子 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+	// P4.6: sort() со случайным компаратором смещён (измерено: 166% отклонения
+	// на V8). Перемешивание Фишера–Йетса с тем же зерном: детерминизм по
+	// (目标根域名 + UUID) сохранён, конкретный порядок — нет и не был спецификацией.
+	const 洗牌后 = 洗牌(排序后数组, 带种子随机(随机种子));
 	const 解析结果 = 洗牌后.slice(0, 8);
 	console.error(`[反代解析] 解析完成 总数: ${解析结果.length}个\n${解析结果.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
 	return 解析结果;

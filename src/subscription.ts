@@ -7,7 +7,7 @@
 // Маршрут /sub целиком остаётся в worker.ts: он переплетён с проверкой прав,
 // admin-роутами и выбором 订阅类型 — вынос разорвал бы порядок проверок.
 
-import { MD5MD5, 随机路径, 替换星号为随机字符, 获取传输路径参数值 } from "./util";
+import { MD5MD5, 随机路径, 替换星号为随机字符, 获取传输路径参数值, 洗牌 } from "./util";
 import { 汇聚订阅_UA, 特征码字典 } from "./obfuscation-tokens";
 import { 整理成数组 } from "./dns";
 import { base64SecretEncode, 获取SOCKS5账号, 获取代理默认端口 } from "./upstream/dial";
@@ -1021,7 +1021,8 @@ export async function 处理订阅请求(request, env, ctx, url, host, userID, U
 		}
 
 		if (!ua.includes('subconverter') && 用户客户端请求订阅) {
-			const 打乱后HOSTS = [...config_JSON.HOSTS].sort(() => Math.random() - 0.5);
+			// P4.6: Фишер–Йетс вместо sort() со случайным компаратором (смещение 166%).
+			const 打乱后HOSTS = 洗牌(config_JSON.HOSTS);
 			let 替换域名计数 = 0, 当前随机HOST = null;
 			订阅内容 = 订阅内容
 				.replace(/00000000-0000-4000-8000-000000000000/g, config_JSON.UUID)

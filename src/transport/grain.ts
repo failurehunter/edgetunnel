@@ -165,7 +165,23 @@ export function 创建上行Grain合包流(目标字节 = 上行合包目标字�
 	};
 }
 
-export function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, canRetry = null, 名称 = '上行队列' }) {
+/**
+ * Хуки, которые очередь зовет наружу. Все, кроме 获取写入器, необязательные.
+ * canRetry возвращает «повтор первой посылки ещё допустим»: если ни один байт
+ * не мог уйти, упавшую запись можно переиграть, иначе — только закрытие,
+ * иначе клиент получит дубликат.
+ */
+interface 上行写入队列参数 {
+	获取写入器: () => { write(chunk: Uint8Array): Promise<void> } | null;
+	获取连接任务?: () => Promise<unknown> | null | undefined;
+	释放写入器?: () => void;
+	重试连接?: () => Promise<unknown>;
+	关闭连接?: (err?: unknown) => void;
+	canRetry?: () => boolean;
+	名称?: string;
+}
+
+export function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, canRetry = null, 名称 = '上行队列' }: 上行写入队列参数) {
 	const grain = 创建Grain收纳器(上行合包目标字节);
 	let draining = false;
 	let closed = false;

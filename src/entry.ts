@@ -9,9 +9,11 @@ import { 应用白名单环境, 取SOCKS5白名单, 获取叉HTTPPadding标识 }
 import { 规范化伪装页URL, 处理伪装页 } from "./decoy";
 import { 识别运营商, 处理订阅请求, 快速订阅重定向 } from "./subscription";
 import { uuidRegex, 处理管理路由, 处理Locations路由 } from "./admin";
-import { 处理叉HTTP请求, 处理gRPC请求, 处理WS请求 } from "./transport/handlers";
+import { 处理叉HTTP请求 } from "./transport/xhttp";
+import { 处理gRPC请求 } from "./transport/grpc";
+import { 处理WS请求 } from "./transport/ws";
 const Version = '2026-09-22 20:01:17';
-let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
+let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
@@ -25,17 +27,20 @@ export function parseSettings(env, request) {
 	};
 }
 
-export function 创建请求上下文(request, env, identity = {}) {
+/**
+ * Контекст запроса (P4.5). Состав сокращён до того, что реально читается:
+ *   settings.dialConcurrency — берётся в relay.ts для 并发拨号;
+ *   dial                    — шов создания TCP-сокета.
+ *
+ * Убрано как мёртвое: client{operator,访问IP,ua} и identity. Ни одно
+ * транспортное место к ним не обращалось. Значения берутся локально там,
+ * где нужны: operator — в 识别运营商 при сборке подписки, 访问IP/ua — в fetch.
+ */
+export function 创建请求上下文(request, env) {
 	return {
 		settings: parseSettings(env, request),
-		client: {
-			operator: 识别运营商(request),
-			访问IP: request.headers?.get('CF-Connecting-IP') || request.headers?.get('True-Client-IP') || request.headers?.get('X-Real-IP') || request.headers?.get('X-Forwarded-For') || request.headers?.get('Fly-Client-IP') || request.headers?.get('X-Appengine-Remote-Addr') || request.headers?.get('X-Cluster-Client-IP') || '未知IP',
-			ua: request.headers?.get('User-Agent') || 'null',
-		},
-		identity,
 		// Шов dial: единственное поле контекста (без интерфейса и фабрики).
-		// Лениво — запросы без fetcher (admin/version/...) контекст создают безболезненно.
+		// Лениво — запросы без fetcher (admin/version/...) создают контекст безболезненно.
 		dial: (options, init) => 创建请求TCP连接器(request)(options, init),
 	};
 }
@@ -70,7 +75,7 @@ export default {
 		// Флаги 反代并发拨号数/预加载竞速拨号/白名单 живут в relay.ts (шаг 3.8) — пишем их
 		// через 应用拨号环境(), читаем 白名单 через 取SOCKS5白名单(); см. config.ts (шаг 3.10).
 		const settings = parseSettings(env, request);
-		const 请求上下文 = 创建请求上下文(request, env, { host, userID });
+		const 请求上下文 = 创建请求上下文(request, env);
 		let 默认反代IP = (`${request.cf.colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
 		if (env.PROXYIP) {
 			const proxyIPs = await 整理成数组(env.PROXYIP);

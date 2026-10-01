@@ -226,7 +226,24 @@ export async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 	SS递增Nonce计数器(nonceCounter);
 	return new Uint8Array(pt);
 }
-export function sha224(s) {
+// P4.6: кэш sha224(密码) на изолят. Значение пароля не меняется в течение жизни
+// воркера, а хеш считается на каждом входящем пакете Trojan и в двух местах
+// (парсер протокола и детектор early-data). Ограничение по размеру — чтобы
+// не расти при переборе разных значений.
+const SHA224缓存 = new Map<string, string>();
+const SHA224缓存上限 = 8;
+
+export function sha224(s: string): string {
+	const key = String(s ?? "");
+	const cached = SHA224缓存.get(key);
+	if (cached !== undefined) return cached;
+	const value = sha224计算(key);
+	if (SHA224缓存.size >= SHA224缓存上限) SHA224缓存.clear();
+	SHA224缓存.set(key, value);
+	return value;
+}
+
+function sha224计算(s: string): string {
 	const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
 	const r = (n, b) => ((n >>> b) | (n << (32 - b))) >>> 0;
 	s = unescape(encodeURIComponent(s));
@@ -257,4 +274,203 @@ export function sha224(s) {
 		for (let j = 24; j >= 0; j -= 8)hex += ((h[i] >>> j) & 0xFF).toString(16).padStart(2, '0');
 	}
 	return hex;
+}
+
+// ── Единый инкрементальный разбор первого пакета (P4.2) ──────────────────────
+//
+// До этого было три реализации с разной семантикой:
+//   * xhttp — инкрементальные 尝试解析魏烈思首包/尝试解析木马首包 прямо в
+//     transport/handlers.ts, с корректным need_more;
+//   * gRPC и WS — неинкрементальные 解析木马请求/解析魏烈思请求 отсюда же.
+//     Они требуют ПЕРВЫЙ пакет целиком, поэтому фрагментированный первый пакет
+//     давал ложный «Invalid data». Это скрытый баг, а не стилистика: клиент,
+//     разбивший первый пакет, не подключался.
+//
+// Здесь единственная реализация, инкрементальная по построению. Результат —
+// явная трёхзначная форма (P4.6): ok | need_more | invalid. Строка как признак
+// состояния заменена полем 状态; проверка в вызывающем коде идёт по нему.
+//
+// need_more означает «данных ещё мало, добери буфер», invalid — «это не тот
+// протокол или пакет битый», ok — 结果 содержит разобранное.
+
+export function 增量解析魏烈思首包(data, token) {
+	const length = data.byteLength;
+	if (length < 18) return { 状态: 'need_more' };
+	if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
+
+	const optLen = data[17];
+	const cmdIndex = 18 + optLen;
+	if (length < cmdIndex + 1) return { 状态: 'need_more' };
+
+	const cmd = data[cmdIndex];
+	if (cmd !== 1 && cmd !== 2) return { 状态: 'invalid' };
+
+	const portIndex = cmdIndex + 1;
+	if (length < portIndex + 3) return { 状态: 'need_more' };
+
+	const port = (data[portIndex] << 8) | data[portIndex + 1];
+	const addressType = data[portIndex + 2];
+	const addressIndex = portIndex + 3;
+	let headerLen = -1;
+	let hostname = '';
+
+	if (addressType === 1) {
+		if (length < addressIndex + 4) return { 状态: 'need_more' };
+		hostname = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
+		headerLen = addressIndex + 4;
+	} else if (addressType === 2) {
+		if (length < addressIndex + 1) return { 状态: 'need_more' };
+		const domainLen = data[addressIndex];
+		if (length < addressIndex + 1 + domainLen) return { 状态: 'need_more' };
+		hostname = 魏烈思文本解码器.decode(data.subarray(addressIndex + 1, addressIndex + 1 + domainLen));
+		headerLen = addressIndex + 1 + domainLen;
+	} else if (addressType === 3) {
+		if (length < addressIndex + 16) return { 状态: 'need_more' };
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			const base = addressIndex + i * 2;
+			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+		}
+		hostname = ipv6.join(':');
+		headerLen = addressIndex + 16;
+	} else return { 状态: 'invalid' };
+
+	if (!hostname) return { 状态: 'invalid' };
+
+	return {
+		状态: 'ok',
+		结果: {
+			协议: 'vl' + 'ess',
+			hostname,
+			port,
+			isUDP: cmd === 2,
+			rawData: data.subarray(headerLen),
+			respHeader: new Uint8Array([data[0], 0]),
+			原始数据: null,
+		}
+}
+}
+
+export function 增量解析木马首包(data, token) {
+	const 密码哈希 = sha224(token);
+	const 密码哈希字节 = SS文本编码器.encode(密码哈希);
+	const length = data.byteLength;
+	if (length < 58) return { 状态: 'need_more' };
+	if (data[56] !== 0x0d || data[57] !== 0x0a) return { 状态: 'invalid' };
+	for (let i = 0; i < 56; i++) {
+		if (data[i] !== 密码哈希字节[i]) return { 状态: 'invalid' };
+	}
+
+	const socksStart = 58;
+	if (length < socksStart + 2) return { 状态: 'need_more' };
+	const cmd = data[socksStart];
+	if (cmd !== 1 && cmd !== 3) return { 状态: 'invalid' };
+	const isUDP = cmd === 3;
+
+	const atype = data[socksStart + 1];
+	let cursor = socksStart + 2;
+	let hostname = '';
+
+	if (atype === 1) {
+		if (length < cursor + 4) return { 状态: 'need_more' };
+		hostname = `${data[cursor]}.${data[cursor + 1]}.${data[cursor + 2]}.${data[cursor + 3]}`;
+		cursor += 4;
+	} else if (atype === 3) {
+		if (length < cursor + 1) return { 状态: 'need_more' };
+		const domainLen = data[cursor];
+		if (length < cursor + 1 + domainLen) return { 状态: 'need_more' };
+		hostname = 木马文本解码器.decode(data.subarray(cursor + 1, cursor + 1 + domainLen));
+		cursor += 1 + domainLen;
+	} else if (atype === 4) {
+		if (length < cursor + 16) return { 状态: 'need_more' };
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			const base = cursor + i * 2;
+			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+		}
+		hostname = ipv6.join(':');
+		cursor += 16;
+	} else return { 状态: 'invalid' };
+
+	if (!hostname) return { 状态: 'invalid' };
+	if (length < cursor + 4) return { 状态: 'need_more' };
+
+	const port = (data[cursor] << 8) | data[cursor + 1];
+	if (data[cursor + 2] !== 0x0d || data[cursor + 3] !== 0x0a) return { 状态: 'invalid' };
+	const dataOffset = cursor + 4;
+
+	return {
+		状态: 'ok',
+		结果: {
+			协议: 'trojan',
+			hostname,
+			port,
+			isUDP,
+			rawData: data.subarray(dataOffset),
+			原始数据: data,
+			respHeader: null,
+		}
+	};
+};
+
+/**
+ * Дописывает очередной фрагмент к накопленному первому пакету.
+ *
+ * Инкрементальный разбор бесполезен без накопления: need_more означает «позови
+ * ещё», и вызывающий обязан сохранить то, что уже есть, иначе следующий вызов
+ * разберёт тот же обрывок и сессия застрянет навсегда.
+ *
+ * Первый пакет ограничен: клиент не пришлёт больше, чем поместится в один
+ * разбор, поэтому рост здесь естественно ограничен размером первого пакета.
+ */
+export function 累积首包(已有, 新块) {
+	const base = 已有 || new Uint8Array(0);
+	const chunk = 数据转Uint8Array(新块);
+	if (!chunk.byteLength) return base;
+	const out = new Uint8Array(base.byteLength + chunk.byteLength);
+	out.set(base, 0);
+	out.set(chunk, base.byteLength);
+	return out;
+}
+
+/**
+ * Определяет протокол по началу первого пакета.
+ *
+ * Прежний признак — «длина ≥ 58 и байты 56..57 равны 0d 0a» — работает, только
+ * если клиент прислал первый пакет целиком. При фрагментации первых 58 байт ещё
+ * нет, и признак молча назвал бы троян-пакет 魏烈思-пакетом (58 не набралось =>
+ * «не троян»), после чего разбор пошёл бы не по тому пути.
+ *
+ * Теперь решение принимает сам разбор, потому что заголовки разной длины:
+ * 魏烈симу достаточно 18 байт до проверки UUID, трояну — 58. Отсюда порядок:
+ *
+ *   'vless'    — 魏烈си не отверг пакет: либо разобрал целиком, либо (при длине
+ *                ≥ 18) уже сошёлся UUID и не хватает только адреса;
+ *   'trojan'   — 魏烈си отверг пакет (значит, UUID не совпал), а троян либо
+ *                разобран целиком, либо его заголовок ещё не дописан (< 58 байт).
+ *                Отвергать рано: остаток придёт следующим кадром. Если это мусор,
+ *                троянский разбор отвергнет его на 58-м байте — отказ будет,
+ *                просто чуть позже;
+ *   'invalid'  — оба заголовка дописаны и оба отвергли пакет;
+ *   'need_more' — данных меньше 18, ни один разбор ещё не начался.
+ *
+ * Различать 'invalid' и 'need_more' обязательно: если бы оба случая сводились
+ * к «жди», клиент с мусором получил бы висящую сессию вместо отказа.
+ */
+export function 判断首包协议(data, token) {
+	if (data.byteLength < 18) return 'need_more';
+
+	// Проверка UUID в 魏烈си идёт ДО проверки длины адреса. Поэтому need_more
+	// при длине ≥ 18 означает, что UUID уже совпал, — это верный признак vless,
+	// а не «данных мало». Троян-пакет сюда дойти не может: байты 1..16 у него
+	// заняты hex-символами хеша пароля.
+	const 魏烈思 = 增量解析魏烈思首包(data, token);
+	if (魏烈思.状态 !== 'invalid') return 'vless';
+
+	const 木马 = 增量解析木马首包(data, token);
+	if (木马.状态 === 'ok') return 'trojan';
+	// need_more здесь означает ровно «меньше 58 байт»: заголовок трояна не дописан.
+	if (木马.状态 === 'need_more') return 'trojan';
+
+	return 'invalid';
 }
