@@ -7,7 +7,7 @@
 // Свой: request.body перекладывается в socket.writable через pipeTo с
 // abort-контроллером — без очереди апстрима и без повторов, поэтому сюда
 // не заводится ни 创建远端写入门, ни 判断首包协议.
-const log = (...args) => console.error('[xhttp]', ...args);
+const log = 创建日志器('xhttp');
 import { 获取叉HTTPPadding标识 } from "../config";
 import { 增量解析木马首包, 增量解析魏烈思首包, 魏烈思文本解码器 } from "../protocols";
 import { 有效数据长度 } from "../util";
@@ -15,6 +15,7 @@ import { 创建上行Grain合包流 } from "./grain";
 import { closeSocketQuietly, forwardataTCP, 失效TCP连接世代 } from "./relay";
 import { forwardataudp, isSpeedTestSite, 构造本地204响应, 转发木马UDP数据 } from "./shared";
 import { 创建Upstream会话 } from "./upstream-session";
+import { 创建日志器, 安全错误 } from "../logging";
 
 const HPACKHuffman码长 = [
 	13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
@@ -115,7 +116,7 @@ export async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {
 		responseHeaders.set(本机Padding头, 响应URL.toString());
 	} catch (e) { }
 
-	if (首包.isUDP) return 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, responseHeaders);
+	if (首包.isUDP) return 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, responseHeaders, 请求上下文?.settings?.dnsTarget || null);
 
 	try { reader.releaseLock() } catch (e) { }
 
@@ -149,7 +150,7 @@ export async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {
 			请求上下文: 请求上下文,
 			});
 	} catch (err) {
-		log(`[叉HTTP-Pipe] 连接失败: ${err?.message || err}`);
+		log.错误(`[叉HTTP-Pipe] 连接失败: ${安全错误(err, [首包?.hostname, 首包?.port])}`);
 		清理(err);
 		return new Response('bad gateway', { status: 502 });
 	}
@@ -207,8 +208,14 @@ export async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {
 	return new Response(响应流.readable, { status: 200, headers: responseHeaders });
 }
 
-export function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, responseHeaders) {
-	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
+// P1.5: dns目标 передаётся параметром: функция экспортируется, и 请求上下文
+	// в её области видимости нет — чтение оттуда дало бы ReferenceError.
+export function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, responseHeaders, dns目标 = null) {
+	const 木马UDP上下文 = {
+		缓存: new Uint8Array(0),
+		反代地址: 反代上下文.木马反代地址,
+		dns目标,
+	};
 	return new Response(new ReadableStream({
 		async start(controller) {
 			let 已关闭 = false;
@@ -247,7 +254,7 @@ export function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文,
 				}
 				if (!(首包.协议 === 'trojan' && 木马UDP上下文.反代地址) && 首包.rawData?.byteLength) {
 					if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, 叉桥, 木马UDP上下文, request);
-					else await forwardataudp(首包.rawData, 叉桥, udpRespHeader, request);
+					else await forwardataudp(首包.rawData, 叉桥, udpRespHeader, request, null, 木马UDP上下文.dns目标);
 					udpRespHeader = null;
 				}
 				while (true) {
@@ -255,12 +262,12 @@ export function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文,
 					if (done) break;
 					if (!value || value.byteLength === 0) continue;
 					if (首包.协议 === 'trojan') await 转发木马UDP数据(value, 叉桥, 木马UDP上下文, request);
-					else await forwardataudp(value, 叉桥, udpRespHeader, request);
+					else await forwardataudp(value, 叉桥, udpRespHeader, request, null, 木马UDP上下文.dns目标);
 					udpRespHeader = null;
 				}
 			} catch (err) {
 				转发失败 = true;
-				log(`[叉HTTP转发] 处理失败: ${err?.message || err}`);
+				log.错误(`[叉HTTP转发] 处理失败: ${安全错误(err, [首包?.hostname, 首包?.port])}`);
 				closeSocketQuietly(叉桥);
 			} finally {
 				const 保持木马UDP反代下行 = !转发失败 && 首包.协议 === 'trojan' && 木马UDP上下文.反代地址 && 木马UDP上下文.反代Socket;

@@ -3,6 +3,8 @@
 // from worker.ts — function-in-function, behavior preserved (свой log → console).
 
 import { 数据转Uint8Array, 拼接字节数据, 有效数据长度, isIPv4, stripIPv6Brackets, 洗牌, 带种子随机 } from "./util";
+import { 创建日志器 } from "./logging";
+const log = 创建日志器('dns');
 
 export const ALERT_CLOSE_NOTIFY = 0, ALERT_LEVEL_WARNING = 1, ALERT_UNRECOGNIZED_NAME = 112;
 export const shouldIgnoreTlsAlert = fragment => fragment?.[0] === ALERT_LEVEL_WARNING && fragment?.[1] === ALERT_UNRECOGNIZED_NAME;
@@ -90,6 +92,16 @@ export async function withTimeout(promise, timeoutMs, message) {
 	}
 }
 
+/** Человеческие названия rcode: без них в логе не отличить NXDOMAIN от SERVFAIL. */
+const RCODE名称表 = {
+	0: 'NOERROR', 1: 'FORMERR', 2: 'SERVFAIL', 3: 'NXDOMAIN',
+	4: 'NOTIMP', 5: 'REFUSED', 9: 'NOTAUTH',
+};
+
+export function RCODE名称(rcode) {
+	return RCODE名称表[rcode] || `RCODE${rcode}`;
+}
+
 export const DoH缓存 = {};
 export const DoH缓存最大条目 = 256;
 export const DoH记录类型映射 = { A: 1, NS: 2, CNAME: 5, MX: 15, TXT: 16, AAAA: 28, SRV: 33, HTTPS: 65 };
@@ -102,11 +114,11 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 	const 当前时间戳 = Date.now();
 	const 现缓存项 = DoH缓存[缓存键];
 	if (现缓存项 && 当前时间戳 < 现缓存项.过期时间) {
-		console.error(`[DoH查询] 命中缓存 ${域名} ${记录类型} via ${DoH解析服务}`);
+		log.调试(`[DoH查询] 命中缓存 ${域名} ${记录类型} via ${DoH解析服务}`);
 		return 现缓存项.data.map(data => ({ type: qtype, data }));
 	}
 	const 开始时间 = performance.now();
-	console.error(`[DoH查询] 开始查询 ${域名} ${记录类型} via ${DoH解析服务}`);
+	log.调试(`[DoH查询] 开始查询 ${域名} ${记录类型} via ${DoH解析服务}`);
 	try {
 		const 编码域名 = (name) => {
 			const parts = name.endsWith('.') ? name.slice(0, -1).split('.') : name.split('.');
@@ -131,21 +143,25 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 		query.set(qname, 12);
 		qview.setUint16(12 + qname.length, qtype);
 		qview.setUint16(12 + qname.length + 2, 1);
-		console.error(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
+		log.调试(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
 		const response = await fetch(DoH解析服务, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
 			body: query,
 		});
 		if (!response.ok) {
-			console.warn(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
+			log.调试(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
 			return [];
 		}
 		const buf = new Uint8Array(await response.arrayBuffer());
 		const dv = new DataView(buf.buffer);
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
-		console.error(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, ${ancount}条应答)`);
+		// P1.8: rcode — младшие 4 бита второго 16-битного слова заголовка.
+		// Раньше не читался вовсе, и ошибка резолвера была неотличима от
+		// «NXDOMAIN»: обе попадали в кэш на 5 минут.
+		const rcode = dv.getUint16(2) & 0x0f;
+		log.调试(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, rcode=${rcode}(${RCODE名称(rcode)}), ${ancount}条应答)`);
 		const 解析域名 = (pos) => {
 			const labels = [];
 			let p = pos, jumped = false, endPos = -1, safe = 128;
@@ -204,13 +220,21 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 			answers.push({ name, type, TTL: ttl, data, rdata });
 		}
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
-		console.error(`[DoH查询] 查询完成 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms 共${answers.length}条结果`);
+		log.调试(`[DoH查询] 查询完成 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms 共${answers.length}条结果`);
 		const 相关记录 = answers.filter(answer => answer.type === qtype);
 		const 最小TTL = 相关记录.length > 0 ? Math.min(...相关记录.map(a => a.TTL)) : 0;
-		const 缓存TTL = Math.max(最小TTL, 5 * 60);
+		const 有数据 = 相关记录.length > 0;
+		// P1.8: отрицательный ответ кэшируется только если он честный.
+		// NXDOMAIN (3) и NOERROR (0) без записей — это «домена нет», и повтор
+		// имеет смысл. Ошибка резолвера (SERVFAIL/REFUSED/FORMERR/NOTIMP) — нет:
+		// это его собственная беда, и она проходит, а кэш живёт 5 минут.
+		const 可缓存 = 有数据 || rcode === 0 || rcode === 3;
+		// TTL для отрицательного ответа короче: SOA.MINIMUM обычно 60..300 с,
+		// а пять минут вслепую — ровно то, на что и жаловались.
+		const 缓存TTL = 有数据 ? Math.max(最小TTL, 60) : 30;
 		const 缓存过期时间 = Date.now() + 缓存TTL * 1000;
 		const 缓存数据 = 相关记录.map(answer => answer.data);
-		if (缓存数据.length > 0 || answers.length === 0) {
+		if (可缓存) {
 			if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
 				const 清理时间戳 = Date.now();
 				for (const [缓存条目键, 缓存条目] of Object.entries(DoH缓存)) {
@@ -221,12 +245,12 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 				}
 			}
 			DoH缓存[缓存键] = { data: 缓存数据, 过期时间: 缓存过期时间 };
-			console.error(`[DoH查询] 写入缓存 ${域名} ${记录类型} TTL=${缓存TTL}s${缓存数据.length === 0 ? '（空结果）' : ''}`);
+			log.调试(`[DoH查询] 写入缓存 ${域名} ${记录类型} TTL=${缓存TTL}s${有数据 ? '' : `（负缓存, rcode=${rcode}）`}`);
 		}
 		return answers;
 	} catch (error) {
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
-		console.error(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
+		log.调试(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
 		return [];
 	}
 }
@@ -271,7 +295,7 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 			if (tpMatch) 端口 = parseInt(tpMatch[1], 10);
 		}
 		if (ipv4Regex.test(地址) || ipv6Regex.test(地址)) {
-			console.error(`[反代解析] ${地址} 为IP地址，直接使用`);
+			log.调试(`[反代解析] ${地址} 为IP地址，直接使用`);
 			所有反代数组.push([地址, 端口]);
 			continue;
 		}
@@ -279,36 +303,36 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 		const txtData = txtRecords.filter(r => r.type === 16).map(r => (r.data));
 		const txtAddresses = 解析TXT反代记录(txtData);
 		if (txtAddresses.length > 0) {
-			console.error(`[反代解析] ${地址} 使用TXT记录，共${txtAddresses.length}个结果`);
+			log.调试(`[反代解析] ${地址} 使用TXT记录，共${txtAddresses.length}个结果`);
 			所有反代数组.push(...txtAddresses);
 			continue;
 		}
 		const ipv4List = aRecords.filter(r => r.type === 1).map(r => r.data);
 		if (ipv4List.length > 0) {
-			console.error(`[反代解析] ${地址} 未获取到TXT记录，使用A记录，共${ipv4List.length}个结果`);
+			log.调试(`[反代解析] ${地址} 未获取到TXT记录，使用A记录，共${ipv4List.length}个结果`);
 			所有反代数组.push(...ipv4List.map(ip => [ip, 端口]));
 			continue;
 		}
 		const aaaaRecords = await DoH查询(地址, 'AAAA');
 		const ipv6List = aaaaRecords.filter(r => r.type === 28).map(r => `[${r.data}]`);
 		if (ipv6List.length > 0) {
-			console.error(`[反代解析] ${地址} 未获取到TXT和A记录，使用AAAA记录，共${ipv6List.length}个结果`);
+			log.调试(`[反代解析] ${地址} 未获取到TXT和A记录，使用AAAA记录，共${ipv6List.length}个结果`);
 			所有反代数组.push(...ipv6List.map(ip => [ip, 端口]));
 		} else {
-			console.error(`[反代解析] ${地址} 未获取到TXT、A和AAAA记录，保留原域名`);
+			log.调试(`[反代解析] ${地址} 未获取到TXT、A和AAAA记录，保留原域名`);
 			所有反代数组.push([地址, 端口]);
 		}
 	}
 	const 排序后数组 = 所有反代数组.sort((a, b) => a[0].localeCompare(b[0]));
 	const 目标根域名 = 目标域名.includes('.') ? 目标域名.split('.').slice(-2).join('.') : 目标域名;
 	let 随机种子 = [...(目标根域名 + UUID)].reduce((a, c) => a + c.charCodeAt(0), 0);
-	console.error(`[反代解析] 随机种子: ${随机种子}\n目标站点: ${目标根域名}`);
+	log.调试(`[反代解析] 随机种子: ${随机种子}\n目标站点: ${目标根域名}`);
 	// P4.6: sort() со случайным компаратором смещён (измерено: 166% отклонения
 	// на V8). Перемешивание Фишера–Йетса с тем же зерном: детерминизм по
 	// (目标根域名 + UUID) сохранён, конкретный порядок — нет и не был спецификацией.
 	const 洗牌后 = 洗牌(排序后数组, 带种子随机(随机种子));
 	const 解析结果 = 洗牌后.slice(0, 8);
-	console.error(`[反代解析] 解析完成 总数: ${解析结果.length}个\n${解析结果.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
+	log.调试(`[反代解析] 解析完成 总数: ${解析结果.length}个\n${解析结果.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
 	return 解析结果;
 }
 

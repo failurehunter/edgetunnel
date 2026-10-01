@@ -6,7 +6,7 @@
 // приватные хелперы, и общий файл только мешал читать ветку целиком.
 // SS-сессия вынесена в transport/ss.ts, общая запись в апстрим — в
 // transport/upstream-write.ts. Здесь только состояние WS-сокеты и разбор.
-const log = (...args) => console.error('[ws]', ...args);
+const log = 创建日志器('ws');
 import { UUID字节匹配, sha224, 判断首包协议, 增量解析木马首包, 增量解析魏烈思首包, 累积首包, 解析木马请求, 魏烈思文本解码器 } from "../protocols";
 import { 拼接字节数据, 数据转Uint8Array, 有效数据长度 } from "../util";
 import { 上行队列最大字节, 上行队列最大条目 } from "./grain";
@@ -15,6 +15,7 @@ import { forwardataudp, isSpeedTestSite, 构造WS本地204响应, 转发木马UD
 import { 创建SS会话 } from "./ss";
 import { 创建Upstream会话 } from "./upstream-session";
 import { 创建远端写入门 } from "./upstream-write";
+import { 创建日志器 } from "../logging";
 
 // Пределы WS-early-data. Раньше жили в worker.ts (строка 21); используются только
 // здесь, поэтому переехали вместе с блоком диспетчеров.
@@ -73,7 +74,12 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
-	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
+	// P1.5: dns目标 — из settings запроса, разобран один раз в parseSettings.
+	const 木马UDP上下文 = {
+		缓存: new Uint8Array(0),
+		反代地址: 反代上下文.木马反代地址,
+		dns目标: 请求上下文?.settings?.dnsTarget || null,
+	};
 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
 	let WS显式传输链 = Promise.resolve();
@@ -155,7 +161,7 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 	const 处理WS入站数据 = async (chunk) => {
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await forwardataudp(chunk, serverSock, null, request);
+			return await forwardataudp(chunk, serverSock, null, request, null, 木马UDP上下文.dns目标);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -185,7 +191,7 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 				判断协议类型 = 协议 === 'trojan' ? '木马' : '魏烈思';
 			}
 			判断是否是木马 = 判断协议类型 === '木马';
-			log(`[WS转发] 协议类型: ${判断协议类型} | 来自: ${url.host} | UA: ${request.headers.get('user-agent') || '未知'}`);
+			log.调试(`[WS转发] 协议类型: ${判断协议类型} | 来自: ${url.host} | UA: ${request.headers.get('user-agent') || '未知'}`);
 		}
 
 		if (判断协议类型 === 'ss') {
@@ -250,7 +256,7 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request);
+				return forwardataudp(rawData, serverSock, respHeader, request, null, 木马UDP上下文.dns目标);
 			}
 			await forwardataTCP({
 				host: hostname,
@@ -278,9 +284,9 @@ export async function 处理WS请求(request, yourUUID, url, 反代上下文 = {
 		WS显式队列条目 = 0;
 		const msg = err?.message || `${err}`;
 		if (msg.includes('Network connection lost') || msg.includes('ReadableStream is closed')) {
-			log(`[WS转发] 连接结束: ${msg}`);
+			log.信息(`[WS转发] 连接结束: ${msg}`);
 		} else {
-			log(`[WS转发] 处理失败: ${msg}`);
+			log.错误(`[WS转发] 处理失败: ${msg}`);
 		}
 		远端写入门.队列.清空();
 		远端写入门.释放();

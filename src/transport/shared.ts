@@ -6,8 +6,8 @@
 import { 拼接字节数据, 数据转Uint8Array, 有效数据长度 } from "../util";
 import { 创建请求TCP连接器, 连接木马反代 } from "../upstream/dial";
 import { WebSocket发送并等待, closeSocketQuietly, connectStreams } from "./relay";
-
-const log = (...args) => console.error('[shared]', ...args);
+import { 创建日志器 } from "../logging";
+const log = 创建日志器('shared');
 
 export async function 转发木马UDP反代数据(chunk, webSocket, 上下文, request) {
 	const data = 数据转Uint8Array(chunk);
@@ -94,32 +94,89 @@ export async function 转发木马UDP数据(chunk, webSocket, 上下文, request
 			}
 			dns响应上下文.缓存 = 响应输入.slice(responseCursor);
 			return 响应帧列表.length ? 响应帧列表 : new Uint8Array(0);
-		});
+		}, 上下文?.dns目标);
 	}
 
 	if (上下文) 上下文.缓存 = input.slice(cursor);
 }
 
-export async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
+/** Цель по умолчанию — как было зашито в монолите. */
+/**
+ * Получен ли ответ DNS-over-TCP целиком.
+ * Формат: двухбайтная длина, затем столько же байт сообщения (RFC 7766).
+ * Пока заголовок не прочитан целиком или данных меньше объявленной длины —
+ * ответ неполон и читать надо дальше.
+ */
+function DNS响应Полон(накоплено) {
+	if (!накоплено || накоплено.byteLength < 2) return false;
+	const длина = (накоплено[0] << 8) | накоплено[1];
+	return накоплено.byteLength >= 2 + длина;
+}
+
+/** Цель по умолчанию — как было зашито в монолите. */
+const DNS_目标ПоУмолчанию = { hostname: '8.8.4.4', port: 53 };
+/** Таймаут DNS-запроса, мс. Раньше ожидания не было вовсе. */
+const DNS_ТаймаутПоУмолчанию = 5000;
+
+/**
+ * Запрос DNS пересылается по TCP.
+ *
+ * Параметр 目标 приходит из 请求上下文.settings.dnsTarget: резолвер разбирается
+ * один раз на запрос в parseSettings. Здесь только подстановка значения по
+ * умолчанию — иначе настройка из окружения не дошла бы сюда вовсе.
+ */
+export async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, 目标 = null) {
 	const 请求数据 = 数据转Uint8Array(udpChunk);
 	const 请求字节数 = 请求数据.byteLength;
-	log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
+	目标 = 目标 && 目标.hostname ? 目标 : DNS_目标ПоУмолчанию;
+	log.信息(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> ${目标.hostname}:${目标.port}`);
+	// P1.5: раньше ожидания не было вовсе, а pipeTo ждёт закрытия удалённой
+	// стороны, которого DNS-сервер не делает. По истечении таймаута рвём поток и
+	// закрываем сокет, иначе запрос блокирует все следующие в сессии.
+	let 当前DNSсокет = null;
+	const 中止 = new AbortController();
+	const 定时器 = setTimeout(() => 中止.abort(new Error('DNS 请求超时')), DNS_ТаймаутПоУмолчанию);
 	try {
 		const TCP连接 = 创建请求TCP连接器(request);
-		const tcpSocket = TCP连接({ hostname: '8.8.4.4', port: 53 });
+		当前DNSсокет = TCP连接({ hostname: 目标.hostname, port: 目标.port });
+		const tcpSocket = 当前DNSсокет;
 		let 魏烈思Header = respHeader;
 		const writer = tcpSocket.writable.getWriter();
 		await writer.write(请求数据);
-		log(`[UDP转发] DNS 请求已写入上游: ${请求字节数}B`);
+		log.信息(`[UDP转发] DNS 请求已写入上游: ${请求字节数}B`);
 		writer.releaseLock();
-		await tcpSocket.readable.pipeTo(new WritableStream({
-			async write(chunk) {
-				const 原始响应 = 数据转Uint8Array(chunk);
-				log(`[UDP转发] 收到 DNS 响应: ${原始响应.byteLength}B`);
-				const 封装结果 = 响应封装器 ? await 响应封装器(原始响应) : 原始响应;
-				const 发送片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
-				if (!发送片段列表.length) return;
-				if (webSocket.readyState !== WebSocket.OPEN) return;
+		// P1.5: читаем сами, а не через pipeTo. pipeTo завершается только вместе
+		// с удалённой стороной, а DNS-сервер соединение держит открытым: запрос
+		// занимал сокет до таймаута оператора и блокировал следующие запросы
+		// сессии. Условие завершения известно точно — двухбайтная длина ответа.
+		const 读取器 = tcpSocket.readable.getReader();
+		let накоплено = new Uint8Array(0);
+		while (true) {
+			if (中止.signal.aborted) break;
+			// P1.9: таймер опроса снимается сразу после гонки. Раньше он жил
+			// 250 мс после каждого чтения, в том числе после выхода по таймауту
+			// или по полному ответу — то есть на каждой итерации оставался живой
+			// таймер, а на прерванной сессии их копились десятки.
+			let 定时器 = null;
+			let поступило;
+			try {
+				поступило = await Promise.race([
+					读取器.read(),
+					new Promise((res) => { 定时器 = setTimeout(() => res({ value: null, done: false }), 250); }),
+				]);
+			} finally {
+				if (定时器) clearTimeout(定时器);
+			}
+			if (поступило.value === null) {
+				// Тишина в потоке: проверяем таймаут и ждём дальше.
+				continue;
+			}
+			if (поступило.done) break;
+			const кусок = 数据转Uint8Array(поступило.value);
+			log.信息(`[UDP转发] 收到 DNS 响应: ${кусок.byteLength}B`);
+			const 封装结果 = 响应封装器 ? await 响应封装器(кусок) : кусок;
+			const 发送片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
+			if (发送片段列表.length && webSocket.readyState === WebSocket.OPEN) {
 				for (const fragment of 发送片段列表) {
 					const 转发响应 = 数据转Uint8Array(fragment);
 					if (!转发响应.byteLength) continue;
@@ -133,10 +190,24 @@ export async function forwardataudp(udpChunk, webSocket, respHeader, request, �
 						await WebSocket发送并等待(webSocket, 转发响应);
 					}
 				}
-			},
-		}));
+			}
+			// Ответ получен целиком? Тогда сокет закрываем в finally, а не ждём.
+			накоплено = накоплено.byteLength
+				? 拼接字节数据(накоплено, кусок)
+				: кусок;
+			if (DNS响应Полон(накоплено)) break;
+		}
+		try { 读取器.releaseLock(); } catch (e) { }
 	} catch (error) {
-		log(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
+		// Прерывание по таймауту — не поломка: сокет закрыт ниже, ответ не пришёл.
+		if (中止.signal.aborted) log.错误(`[UDP转发] DNS 转发 не получил ответа за ${DNS_ТаймаутПоУмолчанию}ms`);
+		else log.错误(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
+	} finally {
+		// Таймер снимаем всегда, иначе он держит выполнение до конца запроса.
+		clearTimeout(定时器);
+		// P1.5: сокет закрываем явно. Раньше close() не вызывался вовсе, и сокет
+		// жил до закрытия удалённой стороны — то есть практически навсегда.
+		try { 当前DNSсокет?.close?.(); } catch (e) { }
 	}
 }
 
@@ -159,7 +230,7 @@ export function 构造本地204响应(respHeader = null) {
 	const response = new Uint8Array(协议响应头.byteLength + 本地204响应.byteLength);
 	response.set(协议响应头, 0);
 	response.set(本地204响应, 协议响应头.byteLength);
-	log(`[TCP转发] 构造本地204响应: ${response.byteLength}B`);
+	log.信息(`[TCP转发] 构造本地204响应: ${response.byteLength}B`);
 	return response;
 }
 

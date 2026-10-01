@@ -4,10 +4,10 @@
 // Лог → console (отдельный telemetry — шаг 11).
 
 import { 数据转Uint8Array } from "../util";
+import { 创建日志器 } from "../logging";
 export const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 export const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
-
-const log = (...args) => console.error('[grain]', ...args);
+const log = 创建日志器('grain');
 export function 创建Grain收纳器(容量, 复制合包结果 = false) {
 	let 队列 = [];
 	let 头 = 0;
@@ -274,7 +274,7 @@ export function 创建上行写入队列({ 获取写入器, 获取连接任务 =
 		} catch (err) {
 			closed = true;
 			clear(err);
-			log(`[${名称}] 写入失败: ${err?.message || err}`);
+			log.错误(`[${名称}] 写入失败: ${err?.message || err}`);
 			try { 关闭连接?.(err) } catch (_) { }
 		} finally {
 			draining = false;
@@ -296,7 +296,7 @@ export function 创建上行写入队列({ 获取写入器, 获取连接任务 =
 			closed = true;
 			const err = Object.assign(new Error(`${名称}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
 			clear(err);
-			log(`[${名称}] 队列超限，关闭连接`);
+			log.信息(`[${名称}] 队列超限，关闭连接`);
 			try { 关闭连接?.(err) } catch (_) { }
 			throw err;
 		}

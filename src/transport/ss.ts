@@ -16,10 +16,11 @@ import { 创建上行写入队列 } from "./grain";
 import { forwardataTCP } from "./relay";
 import { forwardataudp, isSpeedTestSite, 转发木马UDP数据 } from "./shared";
 import { closeSocketQuietly, WebSocket发送并等待 } from "./relay";
+import { 创建日志器 } from "../logging";
 
 // Лог остаётся с префиксом [ss], чтобы в прод-логах было видно, из какого
 // модуля пришло сообщение (раньше писало [handlers]).
-const log = (...args) => console.error("[ss]", ...args);
+const log = 创建日志器('ss');
 
 export function 创建SS会话({
 	serverSock,
@@ -80,8 +81,8 @@ const 获取SS上下文 = async () => {
 							if (lengthPlain.byteLength !== 2) continue;
 							const payloadLength = (lengthPlain[0] << 8) | lengthPlain[1];
 							if (payloadLength < 0 || payloadLength > 加密配置.maxChunk) continue;
-							if (offset > 0) log(`[SS入站] 检测到前导噪声 ${offset}B，已自动对齐`);
-							if (加密配置.method !== 首选加密配置.method) log(`[SS入站] URL enc=${请求加密方式 || 首选加密配置.method} 与实际 ${加密配置.method} 不一致，已自动切换`);
+							if (offset > 0) log.信息(`[SS入站] 检测到前导噪声 ${offset}B，已自动对齐`);
+							if (加密配置.method !== 首选加密配置.method) log.信息(`[SS入站] URL enc=${请求加密方式 || 首选加密配置.method} 与实际 ${加密配置.method} 不一致，已自动切换`);
 							入站状态.buffer = 入站状态.buffer.subarray(初始化最小长度);
 							入站状态.decryptKey = decryptKey;
 							入站状态.nonceCounter = nonceCounter;
@@ -179,7 +180,7 @@ const 获取SS上下文 = async () => {
 						}
 					});
 				}).catch((error) => {
-					log(`[SS发送] 加密失败: ${error?.message || error}`);
+					log.错误(`[SS发送] 加密失败: ${error?.message || error}`);
 					closeSocketQuietly(serverSock);
 				});
 				return SS发送队列;
@@ -223,7 +224,7 @@ const 处理SS数据 = async (chunk) => {
 	} catch (err) {
 		const msg = err?.message || `${err}`;
 		if (msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
-			log(`[SS入站] 解密失败，连接关闭: ${msg}`);
+			log.错误(`[SS入站] 解密失败，连接关闭: ${msg}`);
 			closeSocketQuietly(serverSock);
 			return;
 		}

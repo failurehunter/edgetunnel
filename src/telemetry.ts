@@ -6,6 +6,10 @@
 // Порядок сохранён из монолита: сначала Telegram, потом KV; флаг OFF_LOG читается
 // между ними. Обёртка 请求日志记录 остаётся оркестратором с прежней сигнатурой.
 
+import { 创建日志器 } from './logging';
+
+const log = 创建日志器('telemetry');
+
 const KV容量限制 = 4; // MB — вынесено из тела монолита без изменения значения
 
 // Telegram-уведомление. Отдельная экспортируемая функция (мокается раздельно).
@@ -35,7 +39,7 @@ export async function 发送Telegram通知(env, 日志内容, config_JSON) {
 				}
 			});
 		}
-	} catch (error) { console.error(`读取tg.json出错: ${error.message}`) }
+	} catch (error) { log.错误(`读取tg.json出错: ${error.message}`) }
 }
 
 // Запись в KV. Отдельная экспортируемая функция (мокается раздельно).
@@ -70,5 +74,5 @@ export async function 请求日志记录(env, request, 访问IP, 请求类型 = 
 		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON.TG.启用) await 发送Telegram通知(env, 日志内容, config_JSON);
 		await 记录请求日志到KV(env, request, 访问IP, 请求类型, 日志内容, 是否写入KV日志);
-	} catch (error) { console.error(`日志记录失败: ${error.message}`) }
+	} catch (error) { log.错误(`日志记录失败: ${error.message}`) }
 }

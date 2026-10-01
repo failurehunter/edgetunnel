@@ -8,20 +8,38 @@
 import { MD5MD5, 掩码敏感信息, 随机路径, 获取传输路径参数值 } from "./util";
 import { 整理成数组 } from "./dns";
 import { 特征码字典 } from "./obfuscation-tokens";
-
-const log = (...args) => console.error('[config]', ...args);
+import { 创建日志器 } from "./logging";
+const log = 创建日志器('config');
 
 // SOCKS5-белый список: значение по умолчанию для конфига, читается также из
 // transport/relay.ts. Раньше жил в worker.ts (строка 12) — переехал сюда, чтобы
 // config.ts не зависел от transport/relay.ts (инверсия слоёв, шаг 3.8).
-let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
+const 默认白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 
 // Вызывается из fetch-обработчика worker.ts на месте старой строки 77.
-export function 应用白名单环境(合并白名单) {
-	if (合并白名单) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(合并白名单))];
+
+/**
+ * Правила SOCKS5-белого списка.
+ *
+ * P1.10: список больше не накапливается в модуле. Пришёл аргументом — берётся
+ * он, не пришёл — умолчания. Прежде 应用白名单环境 дописывала в модульный
+ * массив, и отозванное правило не исчезало до перезапуска изолиата.
+ */
+export function 取SOCKS5白名单(правила = null) {
+	const изЗапроса = Array.isArray(правила) ? 规则去重(правила) : [];
+	return изЗапроса.length ? изЗапроса : 默认白名单;
 }
 
-export function 取SOCKS5白名单() { return SOCKS5白名单; }
+/** Правила GO2SOCKS5 из окружения; пусто — берутся умолчания. */
+export function 解析白名单环境(env) {
+	const 原始 = String(env?.GO2SOCKS5 || '').trim();
+	if (!原始) return null;
+	return 原始.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function 规则去重(список) {
+	return [...new Set(список.map(x => String(x).trim().toLowerCase()).filter(Boolean))];
+}
 
 export function 获取叉HTTPPadding标识(yourUUID) {
 	return { 头: yourUUID.slice(1, 7), 键: '_' + yourUUID.slice(25, 31) };
@@ -101,7 +119,8 @@ export async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0
 				启用: null,
 				全局: false,
 				账号: '',
-				白名单: 取SOCKS5白名单(),
+				// P1.10: правила из окружения запроса, без накопления в модуле.
+				白名单: 取SOCKS5白名单(解析白名单环境(env)),
 			},
 			路径模板: {
 				[_p]: "proxyip=" + 占位符,
@@ -162,7 +181,7 @@ export async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0
 			config_JSON = JSON.parse(configJSON);
 		}
 	} catch (error) {
-		console.error(`读取config_JSON出错: ${error.message}`);
+		log.错误(`读取config_JSON出错: ${error.message}`);
 		config_JSON = 默认配置JSON;
 	}
 
@@ -262,7 +281,7 @@ export async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0
 			config_JSON.TG.BotToken = TG_JSON.BotToken ? 掩码敏感信息(TG_JSON.BotToken) : null;
 		}
 	} catch (error) {
-		console.error(`读取tg.json出错: ${error.message}`);
+		log.错误(`读取tg.json出错: ${error.message}`);
 	}
 
 	const 初始化CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
@@ -279,7 +298,7 @@ export async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0
 					const Usage = await response.json();
 					config_JSON.CF.Usage = Usage;
 				} catch (err) {
-					console.error(`请求 CF_JSON.UsageAPI 失败: ${err.message}`);
+					log.错误(`请求 CF_JSON.UsageAPI 失败: ${err.message}`);
 				}
 			} else {
 				config_JSON.CF.Email = CF_JSON.Email ? CF_JSON.Email : null;
@@ -292,7 +311,7 @@ export async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0
 			}
 		}
 	} catch (error) {
-		console.error(`读取cf.json出错: ${error.message}`);
+		log.错误(`读取cf.json出错: ${error.message}`);
 	}
 
 	config_JSON.加载时间 = (performance.now() - 初始化开始时间).toFixed(2) + 'ms';
@@ -348,11 +367,11 @@ export async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToke
 		const workers = sum(acc.workersInvocationsAdaptive);
 		const total = pages + workers;
 		const max = 100000;
-		log(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
+		log.信息(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
 		return { success: true, pages, workers, total, max };
 
 	} catch (error) {
-		console.error('获取使用量错误:', error.message);
+		log.错误('获取使用量错误:', error.message);
 		return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
 	}
 }

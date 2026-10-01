@@ -13,8 +13,8 @@ import { 整理成数组 } from "./dns";
 import { base64SecretEncode, 获取SOCKS5账号, 获取代理默认端口 } from "./upstream/dial";
 import { 读取config_JSON, 获取传输协议配置 } from "./config";
 import { 请求日志记录 } from "./telemetry";
-
-const log = (...args) => console.error('[sub]', ...args);
+import { 创建日志器 } from "./logging";
+const log = 创建日志器('sub');
 
 export function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {
 	const uuid = config_JSON?.UUID || null;
@@ -508,7 +508,7 @@ export async function Singbox订阅配置文件热补丁(SingBox_原始订阅内
 
 		return JSON.stringify(config, null, 2);
 	} catch (e) {
-		console.error("Singbox热补丁执行失败:", e);
+		log.错误("Singbox热补丁执行失败:", e);
 		return JSON.stringify(JSON.parse(sb_json_text), null, 2);
 	}
 }
@@ -737,7 +737,7 @@ export async function 请求优选API(urls, 默认端口 = '443', 超时时间 =
 					return;
 				}
 			} catch (e) {
-				console.error('Failed to decode response:', e);
+				log.错误('Failed to decode response:', e);
 				return;
 			}
 
@@ -971,7 +971,7 @@ export async function 处理订阅请求(request, env, ctx, url, host, userID, U
 					节点备注 = match[3] || 节点地址;  // 备注,默认为地址本身
 				} else {
 					// 不规范的格式，跳过处理返回null
-					console.warn(`[订阅内容] 不规范的IP格式已忽略: ${原始地址}`);
+					log.信息(`[订阅内容] 不规范的IP格式已忽略: ${原始地址}`);
 					return null;
 				}
 
@@ -985,7 +985,7 @@ export async function 处理订阅请求(request, env, ctx, url, host, userID, U
 						完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
 						节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 					} catch (error) {
-						console.warn(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
+						log.错误(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
 					}
 				} else if (反代IP池.length > 0) {
 					const 匹配到的反代IP = 反代IP池.find(p => p.includes(节点地址));

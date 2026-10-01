@@ -12,8 +12,8 @@
 // (console.error пишет всегда, log — только при 调试日志打印). Поведенческий риск
 // тот же, что и у остальных модулей после шага 3.1; отмечен для отдельной задачи.
 import { 拼接字节数据, 数据转Uint8Array, 有效数据长度 } from "../util";
-
-const log = (...args) => console.error("[turn]", ...args);
+import { 创建日志器 } from "../logging";
+const log = 创建日志器('turn');
 
 export const CONNECT_TIMEOUT_MS = 9999;
 export const TURN_STUN_MAGIC_COOKIE = new Uint8Array([0x21, 0x12, 0xa4, 0x42]);

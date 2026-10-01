@@ -5,6 +5,8 @@
 
 import { isIPv4, stripIPv6Brackets, 拼接字节数据, 数据转Uint8Array } from "./util";
 import { shouldIgnoreTlsAlert, ALERT_CLOSE_NOTIFY } from "./dns";
+import { 创建日志器 } from "./logging";
+const log = 创建日志器('tls');
 export const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
 export const CONTENT_TYPE_CHANGE_CIPHER_SPEC = 20, CONTENT_TYPE_ALERT = 21, CONTENT_TYPE_HANDSHAKE = 22, CONTENT_TYPE_APPLICATION_DATA = 23;
 export const HANDSHAKE_TYPE_CLIENT_HELLO = 1, HANDSHAKE_TYPE_SERVER_HELLO = 2, HANDSHAKE_TYPE_NEW_SESSION_TICKET = 4, HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS = 8, HANDSHAKE_TYPE_CERTIFICATE = 11, HANDSHAKE_TYPE_SERVER_KEY_EXCHANGE = 12, HANDSHAKE_TYPE_CERTIFICATE_REQUEST = 13, HANDSHAKE_TYPE_SERVER_HELLO_DONE = 14, HANDSHAKE_TYPE_CERTIFICATE_VERIFY = 15, HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE = 16, HANDSHAKE_TYPE_FINISHED = 20, HANDSHAKE_TYPE_KEY_UPDATE = 24;
@@ -360,7 +362,21 @@ export class TlsClient {
 	recordHandshake(chunk) { this.handshakeChunks.push(chunk) }
 	transcript() { return 1 === this.handshakeChunks.length ? this.handshakeChunks[0] : concatBytes(...this.handshakeChunks) }
 	getCipherConfig(cipherSuite) { return CIPHER_SUITES_BY_ID.get(cipherSuite) || null }
-	async readChunk(reader) { return this.timeout ? Promise.race([reader.read(), new Promise(((resolve, reject) => setTimeout((() => reject(new Error("TLS read timeout"))), this.timeout)))]) : reader.read() }
+	async readChunk(reader) {
+		if (!this.timeout) return reader.read();
+		// P1.9: таймер обязан сниматься, как только чтение состоялось. Раньше он
+		// жил все 30 секунд после каждого успешного readChunk: на сессии с
+		// тысячами записей это тысячи живых таймеров, удерживающих изолят.
+		let 定时器 = null;
+		try {
+			return await Promise.race([
+				reader.read(),
+				new Promise((_, reject) => { 定时器 = setTimeout(() => reject(new Error("TLS read timeout")), this.timeout); }),
+			]);
+		} finally {
+			if (定时器) clearTimeout(定时器);
+		}
+	}
 	async readRecordsUntil(reader, predicate, closedError) {
 		for (; ;) {
 			let record;

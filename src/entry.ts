@@ -1,11 +1,11 @@
 // @ts-nocheck
 // Фаза 3, Шаг 3.1: чистые утилиты вынесены функция-в-функцию в src/util.ts.
 import { MD5MD5 } from "./util";
+import { 创建日志器, 设置日志级别 } from "./logging";
 import { 特征码字典 } from "./obfuscation-tokens";
 import { 整理成数组 } from "./dns";
 import { 反代参数获取, 创建请求TCP连接器 } from "./upstream/dial";
-import { 应用拨号环境 } from "./transport/relay";
-import { 应用白名单环境, 取SOCKS5白名单, 获取叉HTTPPadding标识 } from "./config";
+import { 取SOCKS5白名单, 获取叉HTTPPadding标识, 解析白名单环境 } from "./config";
 import { 规范化伪装页URL, 处理伪装页 } from "./decoy";
 import { 识别运营商, 处理订阅请求, 快速订阅重定向 } from "./subscription";
 import { uuidRegex, 处理管理路由, 处理Locations路由 } from "./admin";
@@ -13,7 +13,7 @@ import { 处理叉HTTP请求 } from "./transport/xhttp";
 import { 处理gRPC请求 } from "./transport/grpc";
 import { 处理WS请求 } from "./transport/ws";
 const Version = '2026-09-22 20:01:17';
-let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
+const log = 创建日志器('entry');
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
@@ -23,8 +23,34 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 // Ни одно request-зависимое значение не пишется в module-scope во время обслуживания.
 export function parseSettings(env, request) {
 	return {
+		// P1.10: все dial-настройки читаются отсюда, на каждый запрос заново.
+		// Раньше 预加载竞速拨号 и 反代并发拨号数 жили в модуле relay и накапливались
+		// между запросами: включённый флаг уже нельзя было выключить, число —
+		// заменить. Значения по умолчанию — те же, что были в модуле.
 		dialConcurrency: Math.max(1, Number(env?.TCP_CONCURRENT_DIAL) || 2),
+		proxyConcurrency: Math.max(1, Number(env?.PROXY_CONCURRENT_DIAL) || 1),
+		preloadRace: ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL)),
+		// P1.10: 白名单 — тоже. Раньше 应用白名单环境 дописывала в модульный
+		// массив, и отозванное правило не исчезало никогда.
+		whiteList: 取SOCKS5白名单(解析白名单环境(env)),
+		// P1.5: цель DNS-over-TCP. Раньше резолвер был зашит в коде (8.8.4.4).
+		dnsTarget: 解析DNS目标(env),
 	};
+}
+
+
+/**
+ * Цель DNS-запроса из окружения. `адрес`, `адрес:порт` или `[ipv6]:порт`.
+ * Пусто или нечитаемо — значение по умолчанию, как было зашито.
+ */
+export function 解析DNS目标(env) {
+	const 原始 = String(env?.DNS_TCP_RESOLVER || env?.DNS_SERVER || '').trim();
+	if (!原始) return { hostname: '8.8.4.4', port: 53 };
+	const 括号内 = 原始.match(/^\[([^\]]+)\](?::(\d+))?$/);
+	if (括号内) return { hostname: 括号内[1], port: Number(括号内[2] || 53) };
+	const 端口 = 原始.match(/^(.*):(\d+)$/);
+	if (端口) return { hostname: 端口[1], port: Number(端口[2]) };
+	return { hostname: 原始, port: 53 };
 }
 
 /**
@@ -64,12 +90,10 @@ export default {
 		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
-		调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
-		应用拨号环境({
-			PRELOAD_RACE_DIAL: env.PRELOAD_RACE_DIAL,
-			PROXY_CONCURRENT_DIAL: env.PROXY_CONCURRENT_DIAL,
-		});
-		if (env.GO2SOCKS5) 应用白名单环境(await 整理成数组(env.GO2SOCKS5));
+		// P1: уровень пишется присваиванием, а не «sticky OR». Прежний
+		// 调试日志打印 = ... || 调试日志打印 не давал погасить логирование
+		// обновлением переменной: однажды включённый, он жил до перезапуска изоликата.
+		设置日志级别(env);
 		// TCP并发拨号数 больше не пишется на уровне запроса (Шаг 1.1, реестр 1.1, строка 1);
 		// значение живёт в RequestContext.settings, см. parseSettings/创建请求上下文.
 		// Флаги 反代并发拨号数/预加载竞速拨号/白名单 живут в relay.ts (шаг 3.8) — пишем их
@@ -83,7 +107,6 @@ export default {
 			默认反代兜底 = false;
 		};
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
-		if (缓存SOCKS5白名单 === null) 缓存SOCKS5白名单 = 取SOCKS5白名单();
 		if (访问路径 === 'version') {// 版本信息接口
 			const 请求UUID = (url.searchParams.get('uuid') || '').toLowerCase();
 			if (uuidRegex.test(请求UUID)) {
@@ -99,17 +122,17 @@ export default {
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
-			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
+			log.调试(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url, 反代上下文, 请求上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
-				log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
+				log.调试(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
 				return await 处理gRPC请求(request, userID, 反代上下文, 请求上下文);
 			}
-			log(`[叉HTTP] 命中请求: ${url.pathname}${url.search}`);
+			log.调试(`[叉HTTP] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理叉HTTP请求(request, userID, 反代上下文, 请求上下文);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
@@ -135,6 +158,3 @@ export default {
 	}
 };
 
-function log(...args) {
-	if (调试日志打印) console.log(...args);
-}

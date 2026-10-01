@@ -20,8 +20,9 @@ import {
 	addTurnMessageIntegrity,
 	parseTurnErrorCode,
 } from "./turn";
+import { 创建日志器, 安全错误 } from "../logging";
 
-export const log = (...args) => console.error('[dial]', ...args);
+const log = 创建日志器('dial');
 
 export const 反代协议默认端口 = { socks5: 1080, http: 80, https: 443, turn: 3478, sstp: 443 };
 export const SOCKS5账号Base64正则 = /^(?:[A-Z0-9+/]{4})*(?:[A-Z0-9+/]{2}==|[A-Z0-9+/]{3}=)?$/i;
@@ -126,33 +127,141 @@ export function base64SecretDecode(encoded, secret) {
 	return decoder.decode(data);
 }
 
+/**
+ * Длина ответа SOCKS5 CONNECT: VER REP RSV ATYP BND.ADDR BND.PORT.
+ * Зависит от ATYP, поэтому фиксированной длины нет.
+ *
+ * null означает «данных пока недостаточно, длину определить нельзя». Это
+ * принципиально отличается от числа: раньше здесь возвращалось 2, и для
+ * фрагмента длиной 2 байта цикл дочитывания не выполнялся вовсе, а остаток
+ * ответа терялся вместе с хвостом.
+ */
+function SOCKS5连接响应长度(response) {
+	if (response.byteLength < 4) return null;
+	const atyp = response[3];
+	if (atyp === 0x01) return 4 + 4 + 2;      // IPv4
+	if (atyp === 0x04) return 4 + 16 + 2;     // IPv6
+	if (atyp === 0x03) {
+		if (response.byteLength < 5) return null;
+		return 4 + 1 + response[4] + 2;       // домен: 1 байт длины + имя
+	}
+	return null;                                // неизвестный ATYP — дочитаем
+}
+
+/**
+ * Возвращает поток, который отдаёт 首块 первым, а затем данные исходного потока.
+ *
+ * Зачем. Сервер прокси вправе писать данные туннеля сразу после ответа на
+ * CONNECT, не дожидаясь клиентских данных. Если эти байты просто выбросить,
+ * клиент не получит ответа на свой первый запрос; если не дочитать ответ
+ * CONNECT до конца, нельзя отличить BND.ADDR от начала туннеля.
+ *
+ * Раньше для этого вставляли TransformStream и писали в его writable ДО pipeTo.
+ * Так нельзя: `await write()` ждёт читателя, а он появляется только из pipeTo, —
+ * взаимная блокировка; без await запись отменяется releaseLock(). Здесь просто
+ * новый ReadableStream, порядок задан самим потоком.
+ */
+function 附加首块(поток, 首块) {
+	if (有效数据长度(首块) <= 0) return поток;
+	const reader = поток.getReader();
+	let отдал首块 = false;
+	return new ReadableStream({
+		async pull(ctrl) {
+			if (!отдал首块) {
+				отдал首块 = true;
+				ctrl.enqueue(数据转Uint8Array(首块));
+				return;
+			}
+			try {
+				const { done, value } = await reader.read();
+				if (done) ctrl.close();
+				else ctrl.enqueue(数据转Uint8Array(value));
+			} catch (error) {
+				ctrl.error(error);
+			}
+		},
+		cancel(reason) { try { reader.cancel(reason); } catch (e) { } },
+	});
+}
+
 export async function socks5Connect(targetHost, targetPort, initialData, TCP连接, parsedSocks5) {
 	const { username, password, hostname, port } = parsedSocks5 || {};
 	const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
+	// P1.6: непрочитанный хвост. Сервер вправе писать сразу после ответа, не
+	// дожидаясь клиентских данных; хвост приходит в том же read() и раньше
+	// пропадал, потому что адресовался только индексом ответа.
+	let 尾 = new Uint8Array(0);
+	/**
+	 * Отдаёт следующую порцию целиком, сохраняя непрочитанный хвост в 尾.
+	 * null означает EOF.
+	 */
+	const 读一块 = async () => {
+		if (尾.byteLength > 0) {
+			const 块 = 尾;
+			尾 = new Uint8Array(0);
+			return 块;
+		}
+		const { done, value } = await reader.read();
+		if (done) return null;
+		return 数据转Uint8Array(value);
+	};
 	try {
 		const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
 		await writer.write(authMethods);
-		let response = await reader.read();
-		if (response.done || response.value.byteLength < 2) throw new Error('S5 method selection failed');
+		let response = await 读一块();
+		if (!response || response.byteLength < 2) throw new Error('S5 method selection failed');
 
-		const selectedMethod = new Uint8Array(response.value)[1];
+		const selectedMethod = response[1];
+		// Ответ выбора метода — ровно 2 байта (VER, METHOD). Всё после них уже
+		// данные туннеля: сервер вправе писать, не дожидаясь нашего CONNECT.
+		尾 = response.subarray(2);
 		if (selectedMethod === 0x02) {
 			if (!username || !password) throw new Error('S5 requires authentication');
 			const userBytes = new TextEncoder().encode(username), passBytes = new TextEncoder().encode(password);
 			const authPacket = new Uint8Array([0x01, userBytes.length, ...userBytes, passBytes.length, ...passBytes]);
 			await writer.write(authPacket);
-			response = await reader.read();
-			if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 authentication failed');
+			response = await 读一块();
+			if (!response || response.byteLength < 2 || response[1] !== 0x00) throw new Error('S5 authentication failed');
+			// Ответ аутентификации (RFC 1929) — тоже ровно 2 байта (VER, REP).
+			尾 = response.subarray(2);
 		} else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
 
 		const hostBytes = new TextEncoder().encode(targetHost);
 		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
 		await writer.write(connectPacket);
-		response = await reader.read();
-		if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 connection failed');
+
+		// P1.6: ответ CONNECT надо дочитать до конца, иначе нельзя отличить
+		// BND.ADDR от первых байт туннеля, пришедших в том же чанке.
+		response = await 读一块();
+		if (!response || response.byteLength < 2 || response[1] !== 0x00) throw new Error('S5 connection failed');
+		// Дочитываем ответ до полной длины. Пока она неизвестна (null), условие
+		// нельзя писать как `byteLength < 2`: для фрагмента длиной 2 байта оно
+		// ложно, цикл не выполнялся, и остаток ответа терялся вместе с хвостом.
+		let 需要 = SOCKS5连接响应长度(response);
+		while (需要 === null || response.byteLength < 需要) {
+			const ещё = await 读一块();
+			if (!ещё) throw new Error('S5 connection reply truncated');
+			const merged = new Uint8Array(response.byteLength + ещё.byteLength);
+			merged.set(response, 0);
+			merged.set(ещё, response.byteLength);
+			response = merged;
+			需要 = SOCKS5连接响应长度(response);
+		}
+		尾 = response.subarray(需要);
 
 		if (有效数据长度(initialData) > 0) await writer.write(initialData);
 		writer.releaseLock(); reader.releaseLock();
+
+		// P1.6: хвост возвращаем в readable — иначе первые байты туннеля пропадают
+		// и клиент не получает ответ на свой первый запрос.
+		if (尾.byteLength > 0) {
+			return {
+				readable: 附加首块(socket.readable, 尾),
+				writable: socket.writable,
+				closed: socket.closed,
+				close: () => socket.close(),
+			};
+		}
 		return socket;
 	} catch (error) {
 		try { writer.releaseLock() } catch (e) { }
@@ -202,12 +311,16 @@ export async function httpConnect(targetHost, targetPort, initialData, HTTPS代�
 
 		// CONNECT 响应头后可能夹带隧道数据，先回灌到可读流，避免首包被吞。
 		if (bytesRead > headerEndIndex) {
-			const { readable, writable } = new TransformStream();
-			const transformWriter = writable.getWriter();
-			await transformWriter.write(responseBuffer.subarray(headerEndIndex, bytesRead));
-			transformWriter.releaseLock();
-			socket.readable.pipeTo(writable).catch(() => { });
-			return { readable, writable: socket.writable, closed: socket.closed, close: () => socket.close() };
+			// P1.6: CONNECT-ответ после заголовка может содержать первые байты
+			// туннеля. Отдаём их до данных сокета. Раньше здесь был
+			// TransformStream с записью ДО pipeTo — приём нерабочий: await ждёт
+			// читателя, а он появляется только из pipeTo.
+			return {
+				readable: 附加首块(socket.readable, responseBuffer.subarray(headerEndIndex, bytesRead)),
+				writable: socket.writable,
+				closed: socket.closed,
+				close: () => socket.close(),
+			};
 		}
 
 		return socket;
@@ -230,7 +343,7 @@ export async function httpsConnect(targetHost, targetPort, initialData, TCP连�
 			await proxySocket.opened;
 			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha });
 			await socket.handshake();
-			log(`[HTTPS代理] TLS版本: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
+			log.信息(`[HTTPS代理] TLS版本: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
 			return socket;
 		} catch (error) {
 			try { proxySocket.close() } catch (e) { }
@@ -242,7 +355,7 @@ export async function httpsConnect(targetHost, targetPort, initialData, TCP连�
 			tlsSocket = await 打开HTTPS代理TLS(false);
 		} catch (error) {
 			if (!/cipher|handshake|TLS Alert|ServerHello|Finished|Unsupported|Missing TLS/i.test(error?.message || `${error || ''}`)) throw error;
-			log(`[HTTPS代理] AES-GCM TLS 握手失败，回退 ChaCha20 兼容模式: ${error?.message || error}`);
+			log.错误(`[HTTPS代理] AES-GCM TLS 握手失败，回退 ChaCha20 兼容模式: ${error?.message || error}`);
 			tlsSocket = await 打开HTTPS代理TLS(true);
 		}
 
@@ -951,7 +1064,7 @@ export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认�
 			保存快照();
 			return 反代上下文;
 		} catch (err) {
-			console.error('解析链式代理参数失败:', err.message);
+			log.错误('解析链式代理参数失败:', 安全错误(err));
 		}
 	}
 
@@ -994,7 +1107,7 @@ export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认�
 		try {
 			反代上下文.木马反代地址 = 解析木马反代地址(木马路径匹配[1].replace(/\/+$/, ''));
 		} catch (err) {
-			console.error('解析木马反代地址失败:', err.message);
+			log.错误('解析木马反代地址失败:', 安全错误(err));
 			反代上下文.木马反代地址 = null;
 		}
 	}
@@ -1043,7 +1156,7 @@ export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认�
 		else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
 		else 启用SOCKS5反代 = 启用SOCKS5反代 || 'socks5';
 	} catch (err) {
-		console.error('解析SOCKS5地址失败:', err.message);
+		log.错误('解析SOCKS5地址失败:', 安全错误(err));
 		启用SOCKS5反代 = null;
 	}
 	保存快照();

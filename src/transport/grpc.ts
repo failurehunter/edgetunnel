@@ -6,7 +6,7 @@
 // приватные хелперы, и общий файл только мешал читать ветку целиком.
 // Первый пакет копится и разбирается инкрементально: клиент вправе разбить
 // его по нескольким кадрам (P4.3, найдено при этом же разносе).
-const log = (...args) => console.error('[grpc]', ...args);
+const log = 创建日志器('grpc');
 import { 判断首包协议, 增量解析木马首包, 增量解析魏烈思首包, 累积首包 } from "../protocols";
 import { 有效数据长度 } from "../util";
 import { 下行Grain包字节 } from "./grain";
@@ -14,6 +14,7 @@ import { forwardataTCP, 失效TCP连接世代 } from "./relay";
 import { forwardataudp, isSpeedTestSite, 构造本地204响应, 转发木马UDP数据 } from "./shared";
 import { 创建Upstream会话 } from "./upstream-session";
 import { 创建远端写入门 } from "./upstream-write";
+import { 创建日志器, 安全错误 } from "../logging";
 
 /** varint по gRPC/HTTP2: младшие 7 бит в байт, старший бит — «есть продолжение». */
 export function 编码gRPCVarint(число) {
@@ -50,16 +51,45 @@ export function 解析gRPCVarint前缀(payload) {
 }
 
 /**
+ * Предел длины одного кадра, байт.
+ *
+ * 4 МиБ — с большим запасом над тем, что реально встречается: максимум
+ * DNS-ответа 64 КиБ, обычное прокси-сообщение меньше. При этом недостижимо
+ * из пяти «случайных» байт, которые иначе задают frameSize до 4 ГиБ: тогда
+ * «данных не хватает» превращалось в «ждём остатка», и буфер рос до конца
+ * запроса, удерживая память изолиата.
+ */
+export const 最大帧长 = 4 * 1024 * 1024;
+
+/**
  * Снимает очередной кадр из буфера.
- * @returns {{grpcPayload: Uint8Array, rest: Uint8Array, frameSize: number} | null}
- *   null — данных пока не хватает, ждём ещё.
+ * @returns {{grpcPayload: Uint8Array, rest: Uint8Array, frameSize: number} | null |
+ *           {拒绝帧: true, 原因: string}}
+ *   null      — данных пока не хватает, ждём ещё;
+ *   拒绝帧     — кадр отвергнут, ждать нечего: вызывающий обязан оборвать сессию,
+ *               иначе буфер продолжит расти.
  */
 export function 拆解gRPC帧(pending) {
 	if (pending.byteLength < 5) return null;
-	const grpcLen = ((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4];
+	// P1.7: `>>> 0` на первом члене НЕ делает итог беззнаковым. Оператор `|`
+	// приводит оба операнда к Int32, поэтому 0xFF,0xFF,0xFF,0xFF давали -1, а
+	// frameSize = 5 + (-1) = 4: заголовок объявлял 4 ГиБ, а разбирался кадр в
+	// 4 байта. Для длины ≥ 2 ГиБ это рассинхронизация потока. Приводить надо
+	// ВЕСЬ результат.
+	const grpcLen = (((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4]) >>> 0;
+	// P1.7: предел проверяется ДО вычисления frameSize и ДО ожидания остатка.
+	if (grpcLen > 最大帧长) return { 拒绝帧: true, 原因: `кадр ${grpcLen}B превышает предел ${最大帧长}B` };
 	const frameSize = 5 + grpcLen;
 	if (pending.byteLength < frameSize) return null;
-	return { grpcPayload: pending.subarray(5, frameSize), rest: pending.slice(frameSize), frameSize };
+	return {
+		grpcPayload: pending.subarray(5, frameSize),
+		// P1.7: subarray, а не slice. slice копировал весь остаток буфера на
+		// КАЖДЫЙ кадр, то есть O(n²) на сессии. Безопасно потому, что
+		// накопительный буфер пересоздаётся на каждом чанке и после создания
+		// не пишется: подбуфер не может быть затёрт позже.
+		rest: pending.subarray(frameSize),
+		frameSize,
+	};
 }
 
 export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 请求上下文 = null) {
@@ -68,7 +98,12 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 	const remoteConnWrapper = 创建Upstream会话(); // P4.1: явная сессия, владелец сокета
 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
 	let isDnsQuery = false;
-	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
+	// P1.5: dns目标 — из settings запроса, разобран один раз в parseSettings.
+	const 木马UDP上下文 = {
+		缓存: new Uint8Array(0),
+		反代地址: 反代上下文.木马反代地址,
+		dns目标: 请求上下文?.settings?.dnsTarget || null,
+	};
 	let 判断是否是木马 = null;
 	// P4.3: накопленный первый пакет — состояние сессии, а не локальная
 	// переменная цикла. Без накопления инкрементальный разбор бессмыслен:
@@ -79,7 +114,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 	// который переменных из области start() не видит. Присваивается сразу под
 	// 关闭连接 — до try, так что к моменту любого вызова 关闭连接 значение есть.
 	let 远端写入门 = null;
-	//log('[gRPC] 开始处理双向流');
+	//log.信息('[gRPC] 开始处理双向流');
 	const grpcHeaders = new Headers({
 		'Content-Type': 'application/grpc',
 		'grpc-status': '0',
@@ -198,6 +233,12 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 					for (;;) {
 						const 帧 = 拆解gRPC帧(pending);
 						if (!帧) break;
+						// P1.7: кадр за пределом не «ждём остатка», а отвергаем:
+						// иначе клиент держал бы буфер растущим до конца запроса.
+						if (帧.拒绝帧) {
+							log.错误(`[gRPC] ${帧.原因}`);
+							throw new Error('gRPC frame too large');
+						}
 						const grpcPayload = 帧.grpcPayload;
 						pending = 帧.rest;
 						if (!grpcPayload.byteLength) continue;
@@ -207,7 +248,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 						if (!payload.byteLength) continue;
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await forwardataudp(payload, grpcBridge, null, request);
+							else await forwardataudp(payload, grpcBridge, null, request, null, 木马UDP上下文.dns目标);
 							continue;
 						}
 						if (remoteConnWrapper.socket || remoteConnWrapper.connectingPromise) {
@@ -231,7 +272,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 								// Инкрементальный разбор отдаёт rawData, а прежний
 								// неинкрементальный — rawClientData.
 								const { port, hostname, rawData, isUDP } = 解析结果.结果;
-								log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
+								log.调试(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
 								if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
 									grpcBridge.send(构造本地204响应());
 									return;
@@ -267,7 +308,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 								// respHeader разбор уже собрал сам; version отдельно
 								// не нужен.
 								const { port, hostname, isUDP, rawData, respHeader } = 解析结果.结果;
-								log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
+								log.调试(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
 								if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
 									grpcBridge.send(构造本地204响应(respHeader));
 									return;
@@ -279,7 +320,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 								grpcBridge.send(respHeader);
 								if (isDnsQuery) {
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request);
+									else await forwardataudp(rawData, grpcBridge, null, request, null, 木马UDP上下文.dns目标);
 								}
 								else await forwardataTCP({
 									host: hostname,
@@ -304,7 +345,7 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 				await 远端写入门.队列.等待空();
 			} catch (err) {
 				转发失败 = true;
-				log(`[gRPC转发] 处理失败: ${err?.message || err}`);
+				log.错误(`[gRPC转发] 处理失败: ${安全错误(err)}`);
 			} finally {
 				const 保持木马UDP反代下行 = !转发失败 && isDnsQuery && 判断是否是木马 && 木马UDP上下文.反代地址 && 木马UDP上下文.反代Socket;
 				if (保持木马UDP反代下行) {

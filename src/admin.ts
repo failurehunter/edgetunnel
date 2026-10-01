@@ -29,6 +29,8 @@ import {
 	sstpConnect,
 } from "./upstream/dial";
 import { TlsClient } from "./tls";
+import { 创建日志器 } from "./logging";
+const log = 创建日志器('admin');
 
 // UUID v4 с корректным вариантом ([89abAB]) — как в монолите.
 export const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
@@ -207,7 +209,7 @@ export async function 处理管理路由(env, request, ctx, url, host, userID, U
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 					return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				} catch (error) {
-					console.error('保存配置失败:', error);
+					log.错误('保存配置失败:', error);
 					return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				}
 			} else if (访问路径 === 'admin/cf.json') { // 保存cf.json配置
@@ -233,7 +235,7 @@ export async function 处理管理路由(env, request, ctx, url, host, userID, U
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 					return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				} catch (error) {
-					console.error('保存配置失败:', error);
+					log.错误('保存配置失败:', error);
 					return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				}
 			} else if (访问路径 === 'admin/tg.json') { // 保存tg.json配置
@@ -249,7 +251,7 @@ export async function 处理管理路由(env, request, ctx, url, host, userID, U
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 					return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				} catch (error) {
-					console.error('保存配置失败:', error);
+					log.错误('保存配置失败:', error);
 					return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				}
 			} else if (区分大小写访问路径 === 'admin/ADD.txt') { // 保存自定义优选IP
@@ -259,7 +261,7 @@ export async function 处理管理路由(env, request, ctx, url, host, userID, U
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
 					return new Response(JSON.stringify({ success: true, message: '自定义IP已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				} catch (error) {
-					console.error('保存自定义IP失败:', error);
+					log.错误('保存自定义IP失败:', error);
 					return new Response(JSON.stringify({ error: '保存自定义IP失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 				}
 			} else return new Response(JSON.stringify({ error: '不支持的POST请求路径' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
