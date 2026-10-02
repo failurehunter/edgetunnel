@@ -43,6 +43,48 @@ export function parseSettings(env, request) {
  * Цель DNS-запроса из окружения. `адрес`, `адрес:порт` или `[ipv6]:порт`.
  * Пусто или нечитаемо — значение по умолчанию, как было зашито.
  */
+/**
+ * Обратный путь по умолчанию: выключен.
+ *
+ * P2. Обоснование — в scripts/_p2-proxyip-default.py: обратный путь есть
+ * голый TCP-релей без TLS, он даёт только выбор edge IP, а дефолтный доменный
+ * proxyip стоит 2-3 синхронных DoH-запроса перед первым байтом клиента, причём
+ * без таймаута. По умолчанию соединение идёт прямо к целевому хосту.
+ *
+ *   PROXYIP=<...>      явный список или домен — обратный путь включён, как было;
+ *   PROXYIP_DEFAULT=1  старый доменный дефолт целиком;
+ *   (ничего)           прямой путь, ни одного DoH-запроса.
+ *
+ * Параметры URL и пути (proxyip=, ip=, pyip=, /proxyip. в пути) продолжают
+ * работать: 反代参数获取 ничего не знает про дефолт и подставляет своё значение.
+ *
+ * 反代兜底 при PROXYIP_DEFAULT — false, а не true, как было. Прежний «兜底» вёл в
+ * connectDirect(`<словарь0>.tp1.<словарь1>.xyz`, 1, …), то есть на порт 1: цель
+ * недостижима, попытка гарантированно проваливается. Оставлять её — значит платить
+ * лишним DNS-запросом и TCP-попыткой за исход, который не может выиграть. Итог
+ * тот же, отказ наступает быстрее.
+ */
+export async function 反代默认设置(env, request) {
+	if (env?.PROXYIP) {
+		const proxyIPs = await 整理成数组(env.PROXYIP);
+		return {
+			反代IP: proxyIPs[Math.floor(Math.random() * proxyIPs.length)],
+			反代兜底: false,
+		};
+	}
+	const флаг = ['1', 'true', 'yes', 'on'].includes(String(env?.PROXYIP_DEFAULT).toLowerCase());
+	if (флаг) {
+		// Старый дефолт целиком. request.cf читается только здесь — при выключенном
+		// обратном пути воркер от cf вообще не зависит.
+		const colo = String(request?.cf?.colo || '').toLowerCase();
+		return {
+			反代IP: `${colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`.toLowerCase(),
+			反代兜底: false,
+		};
+	}
+	return { 反代IP: '', 反代兜底: false };
+}
+
 export function 解析DNS目标(env) {
 	const 原始 = String(env?.DNS_TCP_RESOLVER || env?.DNS_SERVER || '').trim();
 	if (!原始) return { hostname: '8.8.4.4', port: 53 };
@@ -100,12 +142,7 @@ export default {
 		// через 应用拨号环境(), читаем 白名单 через 取SOCKS5白名单(); см. config.ts (шаг 3.10).
 		const settings = parseSettings(env, request);
 		const 请求上下文 = 创建请求上下文(request, env);
-		let 默认反代IP = (`${request.cf.colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
-		if (env.PROXYIP) {
-			const proxyIPs = await 整理成数组(env.PROXYIP);
-			默认反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-			默认反代兜底 = false;
-		};
+		const { 反代IP: 默认反代IP, 反代兜底: 默认反代兜底 } = await 反代默认设置(env, request);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
 		if (访问路径 === 'version') {// 版本信息接口
 			const 请求UUID = (url.searchParams.get('uuid') || '').toLowerCase();

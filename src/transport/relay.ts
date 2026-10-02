@@ -355,6 +355,12 @@ export async function forwardataTCP({
 							记录发送(本次首包数据);
 						} finally { try { writer.releaseLock() } catch (e) { } }
 					}
+				} else if (!ctx反代IP) {
+					// P2: обратного пути нет. Без этого гарда сюда попадал
+					// 整理成数组('') -> [''] — фиктивный кандидат, DoH-запросы к
+					// пустому имени и connectDirect на порт 1. То есть «выключить»
+					// без гарда давало бы гарантированный провал, а не прямой путь.
+					throw new Error('反代未启用：无反代地址且无代理类型');
 				} else {
 					log.调试(`[反代连接] 代理到: ${host}:${portNum}`);
 					const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
