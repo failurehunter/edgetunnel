@@ -193,10 +193,19 @@ export async function forwardataTCP({
 			const 候选 = 候选列表[0];
 			return { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选 };
 		}
-		const attempts = 候选列表.map(候选 => 打开TCP连接(候选.hostname, 候选.port).then(socket => ({ socket, candidate: 候选 })));
+		const attempts = 候选列表.map(候选 =>
+			打开TCP连接(候选.hostname, 候选.port)
+				.then(socket => ({ socket, candidate: 候选 }))
+				// Причина отказа каждой попытки сохраняется: Promise.any теряет её,
+				// отдавая AggregateError с текстом «All promises were rejected».
+				// В лог уходило именно это вместо настоящей причины (например
+				// «预加载解析为空» или getaddrinfo), то есть диагностика была слепой.
+				.catch(err => ({ 错误: err }))
+		);
 		let winner = null;
 		try {
 			winner = await Promise.any(attempts);
+			if (winner.错误) throw winner.错误;
 			return winner;
 		} finally {
 			if (winner) {
@@ -298,7 +307,11 @@ export async function forwardataTCP({
 		}
 	}
 
-	async function connecttoPry(允许发送首包 = true) {
+	// P2: 原始原因 нужна для диагностики. Раньше она терялась по дороге: каждый
+	// вызов connecttoPry шёл из места, где причина отказа прямого пути уже была
+	// известна, но внутрь не передавалась, и пользователь видел следствие
+	// («反代未启用») вместо причины. Причина пуста при прямом вызове без отказа.
+	async function connecttoPry(允许发送首包 = true, 原始原因 = null) {
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
 			return;
@@ -356,11 +369,22 @@ export async function forwardataTCP({
 						} finally { try { writer.releaseLock() } catch (e) { } }
 					}
 				} else if (!ctx反代IP) {
-					// P2: обратного пути нет. Без этого гарда сюда попадал
-					// 整理成数组('') -> [''] — фиктивный кандидат, DoH-запросы к
-					// пустому имени и connectDirect на порт 1. То есть «выключить»
-					// без гарда давало бы гарантированный провал, а не прямой путь.
-					throw new Error('反代未启用：无反代地址且无代理类型');
+					// P2: обратного пути нет — ни PROXYIP, ни параметр URL не задан,
+					// а дефолт выключен.
+					//
+					// Раньше здесь стоял безусловный throw новой ошибки, и это была
+					// ошибка: когда до строки доходил ПРЯМОЙ путь, его собственная
+					// причина отказа (например «预加载解析为空») терялась, и в лог
+					// уходило только следствие. Теперь причина, если она известна,
+					// сохраняется: пользователь видит то, что произошло на самом
+					// деле, а не следствие.
+					//
+					// Без гарда сюда попадал 整理成数组('') -> ['']: фиктивный кандидат,
+					// DoH-запросы к пустому имени и connectDirect на порт 1.
+					const причина = 原始原因 || new Error(`反代未启用：无反代地址且无代理类型（${host}:${portNum}）`);
+					try { newSocket?.close?.() } catch (e) { }
+					closeSocketQuietly(ws);
+					throw причина;
 				} else {
 					log.调试(`[反代连接] 代理到: ${host}:${portNum}`);
 					const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
@@ -432,14 +456,22 @@ export async function forwardataTCP({
 			});
 			if (仅建立连接) return initialSocket;
 		} catch (err) {
-			log.调试(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
+			// P2: уровень возвращён с 调试 на 错误. Классификатор П1.1 опустил строку
+			// на debug из-за подстановки адреса — и спрятал единственное сообщение,
+			// ради которого смотрят лог: ПОЧЕМУ не соединилось. Адрес при этом
+			// редактируется, поэтому требование «адреса не логируются по умолчанию»
+			// соблюдается. Диагностика здесь важнее косметики приватности: без
+			// причины отказа в логе видно только следствие.
+			log.错误(`[TCP转发] 直连失败: ${安全错误(err, [host, String(portNum)])}`);
 			if (remoteConnWrapper.generation !== 直连世代) throw err;
 			if (err instanceof Error && err.name === '预加载解析为空') {
 				closeSocketQuietly(ws);
 				throw err;
 			}
 			if (ws.readyState !== WebSocket.OPEN) throw err;
-			await connecttoPry();
+			// P2: причина отказа прямого пути передаётся дальше, иначе при
+			// отсутствии обратного пути в лог уходит только следствие.
+			await connecttoPry(true, err);
 			if (仅建立连接) return remoteConnWrapper.socket;
 		}
 	}
