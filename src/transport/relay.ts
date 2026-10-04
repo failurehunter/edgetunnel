@@ -91,15 +91,12 @@ export async function forwardataTCP({
 	const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
 	const ctx代理参数 = 反代上下文.代理参数 || {};
-	const ctx反代兜底 = 反代上下文.反代兜底 !== undefined ? 反代上下文.反代兜底 : false;
-	// P2: дефолт фолбэка — false, а не true. Прежний «兜底» после отказа всех
-	// кандидатов звал connectDirect(`<словарь0>.tp1.<словарь1>.xyz`, 1, …):
-	// порт 1 недостижим, попытка не могла выиграть, но платила лишним DNS-запросом
-	// и TCP-соединением к Cloudflare-адресу за исход, который уже решён. Для
-	// архитектуры «обратный путь обязателен, прямой может быть заблокирован»
-	// умолчание «провалился proxyip → ещё раз напрямую» противоречит смыслу.
-	let 反代数组索引 = 0;
-	log.调试(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
+	// P2.1: мёртвый фолбэк «兜底» удалён. После P2 (дефолт false) ветка
+	// `connectDirect(<словарь0>.tp1.<словарь1>.xyz, 1)` не достигалась ни одним
+	// путём: 反代默认设置 отдаёт false, 反代参数获取 и параметры URL его не ставят.
+	// Оставлять ветку — держать мёртвый код, писавший на порт 1 заведомо
+	// проигрышную попытку после отказа всех кандидатов.
+	log.调试(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
 	// P1.10: настройки берутся из контекста запроса; без него — умолчания.
 	const 拨号设置 = {
@@ -296,13 +293,21 @@ export async function forwardataTCP({
 		}
 	}
 
-	async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = false) {
+	async function connectProxyIP(address, port, data = null, 所有反代数组 = null) {
 		if (所有反代数组 && 所有反代数组.length > 0) {
 			const 实际并发数 = 拨号设置.反代并发数;
 			for (let i = 0; i < 所有反代数组.length; i += 实际并发数) {
 				const 候选列表 = [];
 				for (let j = 0; j < 实际并发数 && i + j < 所有反代数组.length; j++) {
-					const 索引 = (反代数组索引 + i + j) % 所有反代数组.length;
+					// P2.2: сдвиг 反代数组索引 убран. Раньше после успеха номер
+					// кандидата запоминался и следующий заход начинался с него.
+					// С P1.3 массив уже упорядочен HRW — «лучший для ключа» первый,
+					// и перезапуск с последнего использованного противоречит
+					// приоритету: после «принял и закрыл без данных» ретрай
+					// (P0.1) шёл на тот же подозрительный кандидат и повторял
+					// оборванный поток вместо свежего лучшего. Сканирование всегда
+					// начинается с начала списка.
+					const 索引 = (i + j) % 所有反代数组.length;
 					const [反代地址, 反代端口] = 所有反代数组[索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 索引 });
 				}
@@ -314,7 +319,6 @@ export async function forwardataTCP({
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
 					log.信息(`[反代连接] 成功连接到: ${candidate.hostname}:${candidate.port} (索引: ${candidate.index})`);
-					反代数组索引 = candidate.index;
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
@@ -323,10 +327,9 @@ export async function forwardataTCP({
 			}
 		}
 
-		if (启用反代失败兜底) return connectDirect(address, port, data, false);
-		else {
-			throw new Error('[反代连接] 所有反代连接失败，且未启用反代兜底，连接终止。');
-		}
+		// P2.1: мёртвая ветка фолбэка удалена — единственный исход после отказа
+		// всех кандидатов: соединение невозможно.
+		throw new Error('[反代连接] 所有反代连接失败，连接终止。');
 	}
 
 	// P2: 原始原因 нужна для диагностики. Раньше она терялась по дороге: каждый
@@ -430,7 +433,7 @@ export async function forwardataTCP({
 				} else {
 					log.调试(`[反代连接] 代理到: ${host}:${portNum}`);
 					const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
-					newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
+					newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组);
 					// Внутри connectProxyIP первый пакет уходит через 写入首包,
 					// который сам двигает счётчик. Хвост ниже не должен считать
 					// второй раз (в т.ч. при фолбэке connectProxyIP → connectDirect).

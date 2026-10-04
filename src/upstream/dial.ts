@@ -1027,19 +1027,19 @@ export async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		throw error;
 	}
 }
-export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代兜底 = false) {
+export async function 反代参数获取(url, uuid, 默认反代IP = '') {
 	const { searchParams } = url;
 	const pathname = decodeURIComponent(url.pathname);
 	const pathLower = pathname.toLowerCase();
-	let 反代IP = 默认反代IP, 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {}, 启用反代兜底 = 默认反代兜底;
-	const 反代上下文 = { 木马反代地址: null, 反代IP, 代理类型: null, 代理账号: '', 代理全局: false, 代理参数: {}, 反代兜底: 启用反代兜底 };
+	let 反代IP = 默认反代IP, 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
+	// P2.1: поле 反代兜底 удалено из контекста — см. relay.ts (мёртвый фолбэк).
+	const 反代上下文 = { 木马反代地址: null, 反代IP, 代理类型: null, 代理账号: '', 代理全局: false, 代理参数: {} };
 	const 保存快照 = () => {
 		反代上下文.反代IP = 反代IP;
 		反代上下文.代理类型 = 启用SOCKS5反代;
 		反代上下文.代理账号 = 我的SOCKS5账号;
 		反代上下文.代理全局 = 启用SOCKS5全局反代;
 		反代上下文.代理参数 = { ...parsedSocks5Address };
-		反代上下文.反代兜底 = 启用反代兜底;
 	};
 
 	const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
@@ -1051,7 +1051,6 @@ export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认�
 			if (!链式代理地址.hostname || !链式代理地址.port) throw new Error('链式代理地址缺少 hostname 或 port');
 			我的SOCKS5账号 = '';
 			反代IP = '链式代理';
-			启用反代兜底 = false;
 			启用SOCKS5全局反代 = true;
 			启用SOCKS5反代 = String(type).toLowerCase();
 			parsedSocks5Address = {
@@ -1088,7 +1087,6 @@ export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认�
 	const 设置反代IP = (值) => {
 		反代IP = 值;
 		启用SOCKS5反代 = null;
-		启用反代兜底 = false;
 	};
 
 	const 提取路径值 = (值) => {

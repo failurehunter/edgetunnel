@@ -58,11 +58,9 @@ export function parseSettings(env, request) {
  * Параметры URL и пути (proxyip=, ip=, pyip=, /proxyip. в пути) продолжают
  * работать: 反代参数获取 ничего не знает про дефолт и подставляет своё значение.
  *
- * 反代兜底 при PROXYIP_DEFAULT — false, а не true, как было. Прежний «兜底» вёл в
- * connectDirect(`<словарь0>.tp1.<словарь1>.xyz`, 1, …), то есть на порт 1: цель
- * недостижима, попытка гарантированно проваливается. Оставлять её — значит платить
- * лишним DNS-запросом и TCP-попыткой за исход, который не может выиграть. Итог
- * тот же, отказ наступает быстрее.
+ * P2.1: мёртвый фолбэк «兜底» удалён (говоривший после отказа всех кандидатов
+ * на порт 1 — заведомо проигрышная попытка). Поля 反代兜底 в контексте больше
+ * нет нигде; единственный исход отказа всех кандидатов — ошибка соединения.
  */
 export async function 反代默认设置(env, request) {
 	if (env?.PROXYIP) {
@@ -75,7 +73,6 @@ export async function 反代默认设置(env, request) {
 		const proxyIPs = await 整理成数组(env.PROXYIP);
 		return {
 			反代IP: proxyIPs.join(','),
-			反代兜底: false,
 		};
 	}
 	const флаг = ['1', 'true', 'yes', 'on'].includes(String(env?.PROXYIP_DEFAULT).toLowerCase());
@@ -85,10 +82,9 @@ export async function 反代默认设置(env, request) {
 		const colo = String(request?.cf?.colo || '').toLowerCase();
 		return {
 			反代IP: `${colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`.toLowerCase(),
-			反代兜底: false,
 		};
 	}
-	return { 反代IP: '', 反代兜底: false };
+	return { 反代IP: '' };
 }
 
 export function 解析DNS目标(env) {
@@ -148,7 +144,7 @@ export default {
 		// через 应用拨号环境(), читаем 白名单 через 取SOCKS5白名单(); см. config.ts (шаг 3.10).
 		const settings = parseSettings(env, request);
 		const 请求上下文 = 创建请求上下文(request, env);
-		const { 反代IP: 默认反代IP, 反代兜底: 默认反代兜底 } = await 反代默认设置(env, request);
+		const { 反代IP: 默认反代IP } = await 反代默认设置(env, request);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
 		if (访问路径 === 'version') {// 版本信息接口
 			const 请求UUID = (url.searchParams.get('uuid') || '').toLowerCase();
@@ -164,11 +160,11 @@ export default {
 				if (请求前8总和 === 目标前8总和 && 请求UUID.slice(-12) === 目标UUID.slice(-12)) return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
-			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP);
 			log.调试(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url, 反代上下文, 请求上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
-			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP);
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
