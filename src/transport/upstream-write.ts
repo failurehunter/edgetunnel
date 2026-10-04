@@ -34,6 +34,11 @@ interface 远端写入门参数 {
 		connectingPromise?: Promise<unknown> | null;
 		retryConnect?: () => Promise<unknown>;
 		canRetry首包?: () => boolean;
+		// P0.2: хук «байты реально записаны в апстрим». Relay вешает его на
+		// сессию в момент создания замыкания счётчика; очередь зовёт только
+		// после успешного writer.write. Ленивое обращение — сессия могла быть
+		// создана раньше, чем relay поставил хук (тот же приём, что у canRetry).
+		记发送?: (chunk: Uint8Array) => void;
 	};
 	关闭连接?: (err?: unknown) => void;
 	名称: string;
@@ -72,6 +77,9 @@ export function 创建远端写入门({ remoteConnWrapper, 关闭连接, 名称 
 		},
 		关闭连接,
 		canRetry: () => (typeof remoteConnWrapper.canRetry首包 === 'function' ? remoteConnWrapper.canRetry首包() : true),
+		记录成功发送: chunk => {
+			if (typeof remoteConnWrapper.记发送 === 'function') remoteConnWrapper.记发送(chunk);
+		},
 		名称,
 	});
 

@@ -178,10 +178,19 @@ interface 上行写入队列参数 {
 	重试连接?: () => Promise<unknown>;
 	关闭连接?: (err?: unknown) => void;
 	canRetry?: () => boolean;
+	// P0.2: уведомление об успешно записанном байтовом блоке. Это коррекция
+	// дефекта счётчика 已发送上游字节数: он рос только от первого пакета
+	// (写入首包/TURN/SSTP/хвост connecttoPry), а вся последующая полезная
+	// нагрузка шла через очередь и счётчик не двигала. Из-за этого canRetry()
+	// оставался `true` после реальной отправки, и поздний сбой записи переигрывал
+	// кусок потока на новом апстриме, который предыдущих байт не видел.
+	// Хук зовётся ТОЛЬКО после успешного `await writer.write` (в т.ч. после
+	// успешного ретрая) — при отказе ничего не считается.
+	记录成功发送?: (chunk: Uint8Array) => void;
 	名称?: string;
 }
 
-export function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, canRetry = null, 名称 = '上行队列' }: 上行写入队列参数) {
+export function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 释放写入器, 重试连接, 关闭连接, canRetry = null, 记录成功发送 = null, 名称 = '上行队列' }: 上行写入队列参数) {
 	const grain = 创建Grain收纳器(上行合包目标字节);
 	let draining = false;
 	let closed = false;
@@ -249,6 +258,10 @@ export function 创建上行写入队列({ 获取写入器, 获取连接任务 =
 					if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 					try {
 						await writer.write(item.chunk);
+						// P0.2: считаем ровно то, что реально легло в апстрим. Первый
+						// пакет пишется мимо очереди (写入首包), поэтому двойного
+						// учёта нет: очередь видит только последующие чанки.
+						记录成功发送?.(item.chunk);
 					} catch (err) {
 						释放写入器?.();
 						if (closed) break;
@@ -262,6 +275,7 @@ export function 创建上行写入队列({ 获取写入器, 获取连接任务 =
 						writer = 获取写入器();
 						if (!writer) throw err;
 						await writer.write(item.chunk);
+						记录成功发送?.(item.chunk);
 					}
 					settleCompletions(completions);
 				} catch (err) {

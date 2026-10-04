@@ -36,6 +36,8 @@ export class UpstreamSession {
 	#connectingPromise: any = null;
 	#retryConnect: any = null;
 	#canRetry首包: any = null;
+	// P0.2: хук «байты записаны в апстрим», ставит relay (см. relay.ts).
+	#记发送: any = null;
 	#state: string = 会话状态.IDLE;
 	/** Заведён ли уже whoami-wrapped close; гонки закрытия не должно быть. */
 	#closedOnce = false;
@@ -59,6 +61,10 @@ export class UpstreamSession {
 	set retryConnect(v: any) { this.#retryConnect = v; }
 	get canRetry首包() { return this.#canRetry首包; }
 	set canRetry首包(v: any) { this.#canRetry首包 = v; }
+
+	// P0.2: хук «байты записаны в апстрим» для очереди аплинка (см. relay.ts).
+	get 记发送() { return this.#记发送; }
+	set 记发送(v: any) { this.#记发送 = v; }
 
 	/** Жива ли сессия: не вытеснена и не закрыта. */
 	get active() {
@@ -144,6 +150,7 @@ export class UpstreamSession {
 		this.#connectingPromise = null;
 		this.#retryConnect = null;
 		this.#canRetry首包 = null;
+		this.#记发送 = null;
 	}
 }
 
