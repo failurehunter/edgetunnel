@@ -91,7 +91,13 @@ export async function forwardataTCP({
 	const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
 	const ctx代理参数 = 反代上下文.代理参数 || {};
-	const ctx反代兜底 = 反代上下文.反代兜底 !== undefined ? 反代上下文.反代兜底 : true;
+	const ctx反代兜底 = 反代上下文.反代兜底 !== undefined ? 反代上下文.反代兜底 : false;
+	// P2: дефолт фолбэка — false, а не true. Прежний «兜底» после отказа всех
+	// кандидатов звал connectDirect(`<словарь0>.tp1.<словарь1>.xyz`, 1, …):
+	// порт 1 недостижим, попытка не могла выиграть, но платила лишним DNS-запросом
+	// и TCP-соединением к Cloudflare-адресу за исход, который уже решён. Для
+	// архитектуры «обратный путь обязателен, прямой может быть заблокирован»
+	// умолчание «провалился proxyip → ещё раз напрямую» противоречит смыслу.
 	let 反代数组索引 = 0;
 	log.调试(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
@@ -193,20 +199,29 @@ export async function forwardataTCP({
 			const 候选 = 候选列表[0];
 			return { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选 };
 		}
+		// Причина отказа каждой попытки сохраняется, но rejection остаётся
+		// rejection'ом. Превращать ошибку в fulfillment нельзя: Promise.any
+		// берёт первый fulfilled, и ранний отказ «победил» бы ещё не успевшее
+		// установиться успешное соединение (гонка), а его сокет после этого
+		// закрылся бы в finally как «лузер»: у winner с ошибкой нет socket,
+		// и любой настоящий сокет не равен undefined.
+		const 各候选错误 = [];
 		const attempts = 候选列表.map(候选 =>
 			打开TCP连接(候选.hostname, 候选.port)
 				.then(socket => ({ socket, candidate: 候选 }))
-				// Причина отказа каждой попытки сохраняется: Promise.any теряет её,
-				// отдавая AggregateError с текстом «All promises were rejected».
-				// В лог уходило именно это вместо настоящей причины (например
-				// «预加载解析为空» или getaddrinfo), то есть диагностика была слепой.
-				.catch(err => ({ 错误: err }))
+				.catch(err => { 各候选错误.push(err); throw err; })
 		);
 		let winner = null;
 		try {
 			winner = await Promise.any(attempts);
-			if (winner.错误) throw winner.错误;
 			return winner;
+		} catch (聚合错误) {
+			// Все попытки отказали: отдаём первую сохранённую причину.
+			// Promise.any сам отдал бы AggregateError «All promises were
+			// rejected» — бессмыслицу вместо настоящей причины (например
+			// «预加载解析为空» или getaddrinfo), и диагностика была бы слепой.
+			if (各候选错误.length) throw 各候选错误[0];
+			throw 聚合错误;
 		} finally {
 			if (winner) {
 				for (const attempt of attempts) {
@@ -274,7 +289,7 @@ export async function forwardataTCP({
 		}
 	}
 
-	async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = true) {
+	async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = false) {
 		if (所有反代数组 && 所有反代数组.length > 0) {
 			const 实际并发数 = 拨号设置.反代并发数;
 			for (let i = 0; i < 所有反代数组.length; i += 实际并发数) {
@@ -333,6 +348,13 @@ export async function forwardataTCP({
 
 		const 当前连接任务 = (async () => {
 			let newSocket = null;
+			// P2: флаг «первый пакет уже учтён» для веток с ВНУТРЕННИМ счётом.
+			// Без него хвостовой счёт ниже учитывал бы байты второй раз: TURN/SSTP
+			// и обратный путь уже вызвали 记录发送 в момент реальной записи, и
+			// 已发送上游字节数 показывал 200 вместо реальных 100 (см. разбор
+			// пользователя). Хвост считает только ветки, которые пишут пакет
+			// внутри dial.ts и не имеют доступа к счётчику (Trojan, SOCKS5, HTTP).
+			let 首包已计入 = false;
 			try {
 				if (使用木马反代) {
 					log.调试(`[木马反代] 代理到: ${host}:${portNum}`);
@@ -356,6 +378,7 @@ export async function forwardataTCP({
 						try {
 							await writer.write(数据转Uint8Array(本次首包数据));
 							记录发送(本次首包数据);
+							首包已计入 = true;
 						} finally { try { writer.releaseLock() } catch (e) { } }
 					}
 				} else if (ctx代理类型 === 'sstp') {
@@ -366,6 +389,7 @@ export async function forwardataTCP({
 						try {
 							await writer.write(数据转Uint8Array(本次首包数据));
 							记录发送(本次首包数据);
+							首包已计入 = true;
 						} finally { try { writer.releaseLock() } catch (e) { } }
 					}
 				} else if (!ctx反代IP) {
@@ -389,10 +413,17 @@ export async function forwardataTCP({
 					log.调试(`[反代连接] 代理到: ${host}:${portNum}`);
 					const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
 					newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
+					// Внутри connectProxyIP первый пакет уходит через 写入首包,
+					// который сам двигает счётчик. Хвост ниже не должен считать
+					// второй раз (в т.ч. при фолбэке connectProxyIP → connectDirect).
+					首包已计入 = true;
 				}
 				await 安装当前连接(newSocket, 当前连接世代, downlinkDrain);
-				// P1.2: тот же счётчик, что и на прямом пути.
-				if (本次发送首包) 记录发送(本次首包数据);
+				// P1.2: тот же счётчик, что и на прямом пути. P2: только для веток
+				// БЕЗ внутреннего счёта (Trojan/SOCKS5/HTTP/HTTPS пишут пакет в
+				// dial.ts, где счётчика нет). TURN/SSTP/обратный путь уже посчитали
+				// в момент реальной записи.
+				if (本次发送首包 && !首包已计入) 记录发送(本次首包数据);
 			} catch (err) {
 				try { newSocket?.close?.() } catch (e) { }
 				if (remoteConnWrapper.generation === 当前连接世代) {
@@ -449,7 +480,14 @@ export async function forwardataTCP({
 			log.调试(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
 			const 世代连接 = 开始TCP连接世代(remoteConnWrapper);
 			直连世代 = 世代连接.generation;
-			const initialSocket = await connectDirect(host, portNum, rawData, true);
+			// P2: флаг передаётся из настройки, а не литералом `true`. Литерал был
+			// ложным: читатель видел «direct всегда с прелоадом» и понимал это как
+			// «всегда DoH→IP». На деле DoH-ветка внутри 构建预加载竞速候选列表
+			// гейтится на 拨号设置.预加载竞速 (дефолт false), и литерал `true` не
+			// менял поведение — только запускал холостой вызов конструктора списка.
+			// Теперь вызов отражает фактическое решение: preload включается ровно
+			// тогда, когда включён, и обычный path = connect(hostname:port) без DoH.
+			const initialSocket = await connectDirect(host, portNum, rawData, 拨号设置.预加载竞速);
 			await 安装当前连接(initialSocket, 直连世代, 世代连接.downlinkDrain, async () => {
 				if (remoteConnWrapper.generation !== 直连世代 || remoteConnWrapper.socket !== initialSocket) return;
 				await connecttoPry();

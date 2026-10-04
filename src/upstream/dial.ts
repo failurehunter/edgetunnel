@@ -1027,7 +1027,7 @@ export async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		throw error;
 	}
 }
-export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代兜底 = true) {
+export async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代兜底 = false) {
 	const { searchParams } = url;
 	const pathname = decodeURIComponent(url.pathname);
 	const pathLower = pathname.toLowerCase();
