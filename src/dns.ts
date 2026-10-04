@@ -2,7 +2,7 @@
 // Фаза 3, Шаг 3.3: DNS/DoH/разрешение адресов + TURN/STUN-хелперы + consts.
 // from worker.ts — function-in-function, behavior preserved (свой log → console).
 
-import { 数据转Uint8Array, 拼接字节数据, 有效数据长度, isIPv4, stripIPv6Brackets, 洗牌, 带种子随机 } from "./util";
+import { 数据转Uint8Array, 拼接字节数据, 有效数据长度, isIPv4, stripIPv6Brackets } from "./util";
 import { 创建日志器 } from "./logging";
 const log = 创建日志器('dns');
 
@@ -105,8 +105,20 @@ export function RCODE名称(rcode) {
 export const DoH缓存 = {};
 export const DoH缓存最大条目 = 256;
 export const DoH记录类型映射 = { A: 1, NS: 2, CNAME: 5, MX: 15, TXT: 16, AAAA: 28, SRV: 33, HTTPS: 65 };
+// P1.1: таймаут DoH-запроса. Раньше fetch не имел signal и мог висеть вечно:
+// дозвон ждал резолвер неопределённо долго. Вилка 1–1.5 с: дальше держать
+// соединение без ответа бессмысленно — вся попытка дозвона и так ограничена
+// секундой на кандидата. Значение экспортируется, чтобы тест пиновал вилку.
+export const DoH超时毫秒 = 1200;
+// P1.1: single-flight по «домен:тип». Два конкурентных дозвона на один и тот же
+// proxyip (параллельные кандидаты, повторные соединения, AAAA-хвост вместе с
+// TXT/A) раньше оба промахивались в кэш — он пишется только после ответа — и
+// оба слали одинаковый DoH-запрос. Второй ждёт обещание первого и делит
+// результат; ключ тот же, что у кэша. Это «кэш для ещё не завершившегося
+// запроса»: после ответа запись удаляется, дальше работает DoH缓存.
+export const DoH进行中 = {};
 
-export async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query") {
+export async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query", 超时毫秒 = DoH超时毫秒) {
 	const 规范化域名 = String(域名 || '').trim().toLowerCase().replace(/\.$/, '');
 	const 规范化记录类型 = String(记录类型 || '').trim().toUpperCase();
 	const 缓存键 = `${规范化域名}:${规范化记录类型}`;
@@ -117,141 +129,167 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 		log.调试(`[DoH查询] 命中缓存 ${域名} ${记录类型} via ${DoH解析服务}`);
 		return 现缓存项.data.map(data => ({ type: qtype, data }));
 	}
-	const 开始时间 = performance.now();
-	log.调试(`[DoH查询] 开始查询 ${域名} ${记录类型} via ${DoH解析服务}`);
-	try {
-		const 编码域名 = (name) => {
-			const parts = name.endsWith('.') ? name.slice(0, -1).split('.') : name.split('.');
-			const bufs = [];
-			for (const label of parts) {
-				const enc = new TextEncoder().encode(label);
-				bufs.push(new Uint8Array([enc.length]), enc);
-			}
-			bufs.push(new Uint8Array([0]));
-			const total = bufs.reduce((s, b) => s + b.length, 0);
-			const result = new Uint8Array(total);
-			let off = 0;
-			for (const b of bufs) { result.set(b, off); off += b.length }
-			return result;
-		};
-		const qname = 编码域名(规范化域名);
-		const query = new Uint8Array(12 + qname.length + 4);
-		const qview = new DataView(query.buffer);
-		qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
-		qview.setUint16(2, 0x0100);
-		qview.setUint16(4, 1);
-		query.set(qname, 12);
-		qview.setUint16(12 + qname.length, qtype);
-		qview.setUint16(12 + qname.length + 2, 1);
-		log.调试(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
-		const response = await fetch(DoH解析服务, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
-			body: query,
-		});
-		if (!response.ok) {
-			log.调试(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
-			return [];
-		}
-		const buf = new Uint8Array(await response.arrayBuffer());
-		const dv = new DataView(buf.buffer);
-		const qdcount = dv.getUint16(4);
-		const ancount = dv.getUint16(6);
-		// P1.8: rcode — младшие 4 бита второго 16-битного слова заголовка.
-		// Раньше не читался вовсе, и ошибка резолвера была неотличима от
-		// «NXDOMAIN»: обе попадали в кэш на 5 минут.
-		const rcode = dv.getUint16(2) & 0x0f;
-		log.调试(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, rcode=${rcode}(${RCODE名称(rcode)}), ${ancount}条应答)`);
-		const 解析域名 = (pos) => {
-			const labels = [];
-			let p = pos, jumped = false, endPos = -1, safe = 128;
-			while (p < buf.length && safe-- > 0) {
-				const len = buf[p];
-				if (len === 0) { if (!jumped) endPos = p + 1; break }
-				if ((len & 0xC0) === 0xC0) {
-					if (!jumped) endPos = p + 2;
-					p = ((len & 0x3F) << 8) | buf[p + 1];
-					jumped = true;
-					continue;
+	// P1.1: пока первый запрос в полёте, все совпадающие домен:тип ждут его же.
+	// Проверка после кэша: завершённый запрос уже в DoH缓存, сюда не попадёт.
+	if (DoH进行中[缓存键]) {
+		log.调试(`[DoH查询] слияние с идущим запросом ${域名} ${记录类型}`);
+		return await DoH进行中[缓存键];
+	}
+	const 当前查询 = (async () => {
+		const 开始时间 = performance.now();
+		log.调试(`[DoH查询] 开始查询 ${域名} ${记录类型} via ${DoH解析服务}`);
+		// P1.1: AbortController, а не AbortSignal.timeout: clearTimeout в finally,
+		// таймер не течёт и снимается после самого медленного из fetch/arrayBuffer.
+		// Прерванный запрос падает в catch ниже и в кэш не пишется.
+		const 控制器 = new AbortController();
+		const 定时器 = setTimeout(() => 控制器.abort(), 超时毫秒);
+		try {
+			const 编码域名 = (name) => {
+				const parts = name.endsWith('.') ? name.slice(0, -1).split('.') : name.split('.');
+				const bufs = [];
+				for (const label of parts) {
+					const enc = new TextEncoder().encode(label);
+					bufs.push(new Uint8Array([enc.length]), enc);
 				}
-				labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
-				p += len + 1;
+				bufs.push(new Uint8Array([0]));
+				const total = bufs.reduce((s, b) => s + b.length, 0);
+				const result = new Uint8Array(total);
+				let off = 0;
+				for (const b of bufs) { result.set(b, off); off += b.length }
+				return result;
+			};
+			const qname = 编码域名(规范化域名);
+			const query = new Uint8Array(12 + qname.length + 4);
+			const qview = new DataView(query.buffer);
+			qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
+			qview.setUint16(2, 0x0100);
+			qview.setUint16(4, 1);
+			query.set(qname, 12);
+			qview.setUint16(12 + qname.length, qtype);
+			qview.setUint16(12 + qname.length + 2, 1);
+			log.调试(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
+			const response = await fetch(DoH解析服务, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
+				body: query,
+				signal: 控制器.signal,
+			});
+			if (!response.ok) {
+				log.调试(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
+				return [];
 			}
-			if (endPos === -1) endPos = p + 1;
-			return [labels.join('.'), endPos];
-		};
-		let offset = 12;
-		for (let i = 0; i < qdcount; i++) {
-			const [, end] = 解析域名(offset);
-			offset = /** @type {number} */ (end) + 4;
-		}
-		const answers = [];
-		for (let i = 0; i < ancount && offset < buf.length; i++) {
-			const [name, nameEnd] = 解析域名(offset);
-			offset = /** @type {number} */ (nameEnd);
-			const type = dv.getUint16(offset); offset += 2;
-			offset += 2;
-			const ttl = dv.getUint32(offset); offset += 4;
-			const rdlen = dv.getUint16(offset); offset += 2;
-			const rdata = buf.slice(offset, offset + rdlen);
-			offset += rdlen;
-			let data;
-			if (type === 1 && rdlen === 4) {
-				data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
-			} else if (type === 28 && rdlen === 16) {
-				const segs = [];
-				for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
-				data = segs.join(':');
-			} else if (type === 16) {
-				let tOff = 0;
-				const parts = [];
-				while (tOff < rdlen) {
-					const tLen = rdata[tOff++];
-					parts.push(new TextDecoder().decode(rdata.slice(tOff, tOff + tLen)));
-					tOff += tLen;
+			const buf = new Uint8Array(await response.arrayBuffer());
+			const dv = new DataView(buf.buffer);
+			const qdcount = dv.getUint16(4);
+			const ancount = dv.getUint16(6);
+			// P1.8: rcode — младшие 4 бита второго 16-битного слова заголовка.
+			// Раньше не читался вовсе, и ошибка резолвера была неотличима от
+			// «NXDOMAIN»: обе попадали в кэш на 5 минут.
+			const rcode = dv.getUint16(2) & 0x0f;
+			log.调试(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, rcode=${rcode}(${RCODE名称(rcode)}), ${ancount}条应答)`);
+			const 解析域名 = (pos) => {
+				const labels = [];
+				let p = pos, jumped = false, endPos = -1, safe = 128;
+				while (p < buf.length && safe-- > 0) {
+					const len = buf[p];
+					if (len === 0) { if (!jumped) endPos = p + 1; break }
+					if ((len & 0xC0) === 0xC0) {
+						if (!jumped) endPos = p + 2;
+						p = ((len & 0x3F) << 8) | buf[p + 1];
+						jumped = true;
+						continue;
+					}
+					labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
+					p += len + 1;
 				}
-				data = parts.join('');
-			} else if (type === 5) {
-				const [cname] = 解析域名(offset - rdlen);
-				data = cname;
-			} else {
-				data = Array.from(rdata).map(b => b.toString(16).padStart(2, '0')).join('');
+				if (endPos === -1) endPos = p + 1;
+				return [labels.join('.'), endPos];
+			};
+			let offset = 12;
+			for (let i = 0; i < qdcount; i++) {
+				const [, end] = 解析域名(offset);
+				offset = /** @type {number} */ (end) + 4;
 			}
-			answers.push({ name, type, TTL: ttl, data, rdata });
-		}
-		const 耗时 = (performance.now() - 开始时间).toFixed(2);
-		log.调试(`[DoH查询] 查询完成 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms 共${answers.length}条结果`);
-		const 相关记录 = answers.filter(answer => answer.type === qtype);
-		const 最小TTL = 相关记录.length > 0 ? Math.min(...相关记录.map(a => a.TTL)) : 0;
-		const 有数据 = 相关记录.length > 0;
-		// P1.8: отрицательный ответ кэшируется только если он честный.
-		// NXDOMAIN (3) и NOERROR (0) без записей — это «домена нет», и повтор
-		// имеет смысл. Ошибка резолвера (SERVFAIL/REFUSED/FORMERR/NOTIMP) — нет:
-		// это его собственная беда, и она проходит, а кэш живёт 5 минут.
-		const 可缓存 = 有数据 || rcode === 0 || rcode === 3;
-		// TTL для отрицательного ответа короче: SOA.MINIMUM обычно 60..300 с,
-		// а пять минут вслепую — ровно то, на что и жаловались.
-		const 缓存TTL = 有数据 ? Math.max(最小TTL, 60) : 30;
-		const 缓存过期时间 = Date.now() + 缓存TTL * 1000;
-		const 缓存数据 = 相关记录.map(answer => answer.data);
-		if (可缓存) {
-			if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
-				const 清理时间戳 = Date.now();
-				for (const [缓存条目键, 缓存条目] of Object.entries(DoH缓存)) {
-					if (清理时间戳 >= 缓存条目.过期时间) delete DoH缓存[缓存条目键];
+			const answers = [];
+			for (let i = 0; i < ancount && offset < buf.length; i++) {
+				const [name, nameEnd] = 解析域名(offset);
+				offset = /** @type {number} */ (nameEnd);
+				const type = dv.getUint16(offset); offset += 2;
+				offset += 2;
+				const ttl = dv.getUint32(offset); offset += 4;
+				const rdlen = dv.getUint16(offset); offset += 2;
+				const rdata = buf.slice(offset, offset + rdlen);
+				offset += rdlen;
+				let data;
+				if (type === 1 && rdlen === 4) {
+					data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
+				} else if (type === 28 && rdlen === 16) {
+					const segs = [];
+					for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
+					data = segs.join(':');
+				} else if (type === 16) {
+					let tOff = 0;
+					const parts = [];
+					while (tOff < rdlen) {
+						const tLen = rdata[tOff++];
+						parts.push(new TextDecoder().decode(rdata.slice(tOff, tOff + tLen)));
+						tOff += tLen;
+					}
+					data = parts.join('');
+				} else if (type === 5) {
+					const [cname] = 解析域名(offset - rdlen);
+					data = cname;
+				} else {
+					data = Array.from(rdata).map(b => b.toString(16).padStart(2, '0')).join('');
 				}
+				answers.push({ name, type, TTL: ttl, data, rdata });
+			}
+			const 耗时 = (performance.now() - 开始时间).toFixed(2);
+			log.调试(`[DoH查询] 查询完成 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms 共${answers.length}条结果`);
+			const 相关记录 = answers.filter(answer => answer.type === qtype);
+			const 最小TTL = 相关记录.length > 0 ? Math.min(...相关记录.map(a => a.TTL)) : 0;
+			const 有数据 = 相关记录.length > 0;
+			// P1.8: отрицательный ответ кэшируется только если он честный.
+			// NXDOMAIN (3) и NOERROR (0) без записей — это «домена нет», и повтор
+			// имеет смысл. Ошибка резолвера (SERVFAIL/REFUSED/FORMERR/NOTIMP) — нет:
+			// это его собственная беда, и она проходит, а кэш живёт 5 минут.
+			const 可缓存 = 有数据 || rcode === 0 || rcode === 3;
+			// TTL для отрицательного ответа короче: SOA.MINIMUM обычно 60..300 с,
+			// а пять минут вслепую — ровно то, на что и жаловались.
+			const 缓存TTL = 有数据 ? Math.max(最小TTL, 60) : 30;
+			const 缓存过期时间 = Date.now() + 缓存TTL * 1000;
+			const 缓存数据 = 相关记录.map(answer => answer.data);
+			if (可缓存) {
 				if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
-					delete DoH缓存[Object.keys(DoH缓存)[0]];
+					const 清理时间戳 = Date.now();
+					for (const [缓存条目键, 缓存条目] of Object.entries(DoH缓存)) {
+						if (清理时间戳 >= 缓存条目.过期时间) delete DoH缓存[缓存条目键];
+					}
+					if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
+						delete DoH缓存[Object.keys(DoH缓存)[0]];
+					}
 				}
+				DoH缓存[缓存键] = { data: 缓存数据, 过期时间: 缓存过期时间 };
+				log.调试(`[DoH查询] 写入缓存 ${域名} ${记录类型} TTL=${缓存TTL}s${有数据 ? '' : `（负缓存, rcode=${rcode}）`}`);
 			}
-			DoH缓存[缓存键] = { data: 缓存数据, 过期时间: 缓存过期时间 };
-			log.调试(`[DoH查询] 写入缓存 ${域名} ${记录类型} TTL=${缓存TTL}s${有数据 ? '' : `（负缓存, rcode=${rcode}）`}`);
+			return answers;
+		} catch (error) {
+			const 耗时 = (performance.now() - 开始时间).toFixed(2);
+			log.调试(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
+			return [];
+		} finally {
+			clearTimeout(定时器);
 		}
-		return answers;
-	} catch (error) {
-		const 耗时 = (performance.now() - 开始时间).toFixed(2);
-		log.调试(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
-		return [];
+	})();
+	DoH进行中[缓存键] = 当前查询;
+	try {
+		return await 当前查询;
+	} finally {
+		// Запись из single-flight удаляется только после того, как все ждущие
+		// получили результат: cache.js уже успел записать DoH缓存 к этому моменту,
+		// следующий запрос пойдёт в кэш. Гонки «увидел до удаления, но после
+		// резолва» нет: await уже держит resolved-обещание по ссылке.
+		delete DoH进行中[缓存键];
 	}
 }
 
@@ -261,6 +299,18 @@ export async function 整理成数组(内容) {
 	if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
 	const 地址数组 = 替换后的内容.split(',');
 	return 地址数组;
+}
+
+/** FNV-1a 32-bit: детерминированная распределённая по ключу функция для HRW
+ * (P1.3). Криптостойкость не нужна — важен стабильный разброс весов по ключу
+ * и кандидату. Числовые операции — Math.imul, чтобы результат был ровно 32 бита. */
+export function 哈希字符串(input) {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < input.length; i++) {
+		h ^= input.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return h >>> 0;
 }
 
 export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
@@ -299,7 +349,13 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 			所有反代数组.push([地址, 端口]);
 			continue;
 		}
-		const [txtRecords, aRecords] = await Promise.all([DoH查询(地址, 'TXT'), DoH查询(地址, 'A')]);
+		// P1.1: AAAA-запрос идёт ПАРАЛЛЕЛЬНО с TXT и A, а не после их пустоты.
+		// Раньше третий DNS-запрос стартовал только когда TXT и A оба пустые:
+		// это лишний RTT (и лишний таймаут при висящем резолвере) на в каждом
+		// разрешении. Три запроса начинаются разом, третьим типом пользуемся по
+		// необходимости — попытка дозвона от этого не тормозится, single-flight
+		// (P1.1) дублей не даёт.
+		const [txtRecords, aRecords, aaaaRecords] = await Promise.all([DoH查询(地址, 'TXT'), DoH查询(地址, 'A'), DoH查询(地址, 'AAAA')]);
 		const txtData = txtRecords.filter(r => r.type === 16).map(r => (r.data));
 		const txtAddresses = 解析TXT反代记录(txtData);
 		if (txtAddresses.length > 0) {
@@ -313,7 +369,6 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 			所有反代数组.push(...ipv4List.map(ip => [ip, 端口]));
 			continue;
 		}
-		const aaaaRecords = await DoH查询(地址, 'AAAA');
 		const ipv6List = aaaaRecords.filter(r => r.type === 28).map(r => `[${r.data}]`);
 		if (ipv6List.length > 0) {
 			log.调试(`[反代解析] ${地址} 未获取到TXT和A记录，使用AAAA记录，共${ipv6List.length}个结果`);
@@ -323,16 +378,19 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 			所有反代数组.push([地址, 端口]);
 		}
 	}
-	const 排序后数组 = 所有反代数组.sort((a, b) => a[0].localeCompare(b[0]));
 	const 目标根域名 = 目标域名.includes('.') ? 目标域名.split('.').slice(-2).join('.') : 目标域名;
-	let 随机种子 = [...(目标根域名 + UUID)].reduce((a, c) => a + c.charCodeAt(0), 0);
-	log.调试(`[反代解析] 随机种子: ${随机种子}\n目标站点: ${目标根域名}`);
-	// P4.6: sort() со случайным компаратором смещён (измерено: 166% отклонения
-	// на V8). Перемешивание Фишера–Йетса с тем же зерном: детерминизм по
-	// (目标根域名 + UUID) сохранён, конкретный порядок — нет и не был спецификацией.
-	const 洗牌后 = 洗牌(排序后数组, 带种子随机(随机种子));
-	const 解析结果 = 洗牌后.slice(0, 8);
-	log.调试(`[反代解析] 解析完成 总数: ${解析结果.length}个\n${解析结果.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
+	// P1.3: HRW (rendezvous hashing) вместо seed-перемешивания. Перемешивание
+	// Фишера–Йетса (введённое в P4.6 против смещённого sort() со случайным
+	// компаратором) делало порядок кандидатов равновероятным: кто первый — был
+	// случаен, «лучшего» не существовало. Вес хэша каждого кандидата по ключу
+	// (目标根域名|UUID|地址:端口) даёт стабильный приоритет: для одного целевого
+	// сайта один и тот же кандидат всегда пробуется первым, нагрузка между
+	// репликами распределяется ключом, порядок не зависит от порядка во входном
+	// списке. Равенство весов добивается адресом — детерминизм и тут.
+	const 候选加权 = 所有反代数组.map(([地址, 端口]) => ({ 地址, 端口, 权重: 哈希字符串(`${目标根域名}|${UUID}|${地址}:${端口}`) }));
+	候选加权.sort((a, b) => (b.权重 - a.权重) || a.地址.localeCompare(b.地址));
+	const 解析结果 = 候选加权.slice(0, 8).map(({ 地址, 端口 }) => [地址, 端口]);
+	log.调试(`[反代解析] 解析完成（HRW） 总数: ${解析结果.length}个\n${解析结果.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
 	return 解析结果;
 }
 

@@ -66,9 +66,15 @@ export function parseSettings(env, request) {
  */
 export async function 反代默认设置(env, request) {
 	if (env?.PROXYIP) {
+		// P1.2: весь список целиком, а не случайный элемент. Раньше список
+		// ужимался до одного случайно выбранного адреса: заработать мог только
+		// он. Теперь через обратный путь проходят все кандидаты — 解析地址端口
+		// разберёт их (HRW-порядок, срез до 8), connectProxyIP переберёт по
+		// приоритету. Случайность из выбора уходит: и выбор, и порядок
+		// определяет ключ запроса (целевой домен + UUID).
 		const proxyIPs = await 整理成数组(env.PROXYIP);
 		return {
-			反代IP: proxyIPs[Math.floor(Math.random() * proxyIPs.length)],
+			反代IP: proxyIPs.join(','),
 			反代兜底: false,
 		};
 	}
