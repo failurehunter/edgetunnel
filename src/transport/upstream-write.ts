@@ -39,6 +39,10 @@ interface 远端写入门参数 {
 		// после успешного writer.write. Ленивое обращение — сессия могла быть
 		// создана раньше, чем relay поставил хук (тот же приём, что у canRetry).
 		记发送?: (chunk: Uint8Array) => void;
+		// P2.4 (фикс 2, вариант b): хук «попытка записи чанка очереди». Так же
+		// лениво ставится relay; очередь зовёт ДО writer.write (консервативно:
+		// «возможно, отправлено»). Гейтит 允许重演首包.
+		记写入尝试?: () => void;
 	};
 	关闭连接?: (err?: unknown) => void;
 	名称: string;
@@ -79,6 +83,9 @@ export function 创建远端写入门({ remoteConnWrapper, 关闭连接, 名称 
 		canRetry: () => (typeof remoteConnWrapper.canRetry首包 === 'function' ? remoteConnWrapper.canRetry首包() : true),
 		记录成功发送: chunk => {
 			if (typeof remoteConnWrapper.记发送 === 'function') remoteConnWrapper.记发送(chunk);
+		},
+		记写入尝试: () => {
+			if (typeof remoteConnWrapper.记写入尝试 === 'function') remoteConnWrapper.记写入尝试();
 		},
 		名称,
 	});

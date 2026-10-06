@@ -1,96 +1,16 @@
 // @ts-nocheck
-// Фаза 3, Шаг 3.3: DNS/DoH/разрешение адресов + TURN/STUN-хелперы + consts.
+// Фаза 3, Шаг 3.3: DNS/DoH/разрешение адресов.
 // from worker.ts — function-in-function, behavior preserved (свой log → console).
+//
+// TURN/STUN-хелперы, ошибочно переписанные сюда в шаге 3.3, удалены: рабочая
+// версия — upstream/turn.ts (восстановлена дословно из legacy, dial.ts импортирует
+// из неё). Здесь остаются только DNS-примитивы и ALERT-константы TLS.
 
-import { 数据转Uint8Array, 拼接字节数据, 有效数据长度, isIPv4, stripIPv6Brackets } from "./util";
 import { 创建日志器 } from "./logging";
 const log = 创建日志器('dns');
 
 export const ALERT_CLOSE_NOTIFY = 0, ALERT_LEVEL_WARNING = 1, ALERT_UNRECOGNIZED_NAME = 112;
 export const shouldIgnoreTlsAlert = fragment => fragment?.[0] === ALERT_LEVEL_WARNING && fragment?.[1] === ALERT_UNRECOGNIZED_NAME;
-
-export const CONNECT_TIMEOUT_MS = 9999;
-export const TURN_STUN_MAGIC_COOKIE = new Uint8Array([0x21, 0x12, 0xa4, 0x42]);
-export const TURN_STUN_TYPE = {
-	ALLOCATE_REQUEST: 0x0003, ALLOCATE_SUCCESS: 0x0103, ALLOCATE_ERROR: 0x0113,
-	CREATE_PERMISSION_REQUEST: 0x0008, CREATE_PERMISSION_SUCCESS: 0x0108,
-	CONNECT_REQUEST: 0x000a, CONNECT_SUCCESS: 0x010a,
-	CONNECTION_BIND_REQUEST: 0x000b, CONNECTION_BIND_SUCCESS: 0x010b
-};
-export const TURN_STUN_ATTR = {
-	USERNAME: 0x0006, MESSAGE_INTEGRITY: 0x0008, ERROR_CODE: 0x0009,
-	XOR_PEER_ADDRESS: 0x0012, REALM: 0x0014, NONCE: 0x0015,
-	REQUESTED_TRANSPORT: 0x0019, CONNECTION_ID: 0x002a
-};
-
-export function turnStunPadding(length) { return -length & 3; }
-
-export function createTurnStunAttribute(type, value) {
-	const body = 数据转Uint8Array(value);
-	const attribute = new Uint8Array(4 + body.byteLength + turnStunPadding(body.byteLength));
-	const view = new DataView(attribute.buffer);
-	view.setUint16(0, type);
-	view.setUint16(2, body.byteLength);
-	view.setUint8(4, 0);
-	view.setUint8(5, 0);
-	attribute.set(body, 4);
-	return attribute;
-}
-
-export function createTurnStunMessage(type, transactionId, attributes) {
-	const messages = attributes.map(attr => createTurnStunAttribute(attr.type, attr.value));
-	const totalLength = messages.reduce((sum, m) => sum + m.length, 0);
-	const buffer = new Uint8Array(20 + totalLength);
-	const view = new DataView(buffer.buffer);
-	view.setUint16(0, type);
-	view.setUint16(2, totalLength);
-	buffer.set(TURN_STUN_MAGIC_COOKIE, 4);
-	buffer.set(transactionId, 8);
-	let offset = 20;
-	for (const msg of messages) { buffer.set(msg, offset); offset += msg.length; }
-	return buffer;
-}
-
-export async function readTurnStunMessage(reader, bufferedData = null, timeoutMessage = 'TURN response timed out') {
-	let buffer = 有效数据长度(bufferedData) ? 数据转Uint8Array(bufferedData) : new Uint8Array(0);
-	const pull = async () => {
-		const { done, value } = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, timeoutMessage);
-		if (done) throw new Error('TURN server closed connection');
-		if (value?.byteLength) buffer = 拼接字节数据(buffer, value);
-	};
-	while (buffer.byteLength < 20) await pull();
-	const messageLength = 20 + ((buffer[2] << 8) | buffer[3]);
-	if (messageLength > 65555) throw new Error('TURN response is too large');
-	while (buffer.byteLength < messageLength) await pull();
-	const messageBuffer = buffer.subarray(0, messageLength);
-	if (TURN_STUN_MAGIC_COOKIE.some((value, index) => messageBuffer[4 + index] !== value)) throw new Error('Invalid TURN/STUN response');
-	const view = new DataView(messageBuffer.buffer, messageBuffer.byteOffset, messageBuffer.byteLength);
-	const attributes = {};
-	for (let offset = 20; offset + 4 <= messageLength;) {
-		const type = view.getUint16(offset);
-		const length = view.getUint16(offset + 2);
-		if (offset + 4 + length > messageBuffer.byteLength) break;
-		attributes[type] = messageBuffer.slice(offset + 4, offset + 4 + length);
-		offset += 4 + length + turnStunPadding(length);
-	}
-	return { message: { type: view.getUint16(0), attributes }, extraData: buffer.byteLength > messageLength ? buffer.subarray(messageLength) : null };
-}
-
-export async function writeTurnBytes(writer, bytes, timeoutMessage) {
-	await withTimeout(writer.write(bytes), CONNECT_TIMEOUT_MS, timeoutMessage);
-}
-
-export async function withTimeout(promise, timeoutMs, message) {
-	let timer;
-	try {
-		return await Promise.race([
-			promise,
-			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs) })
-		]);
-	} finally {
-		clearTimeout(timer);
-	}
-}
 
 /** Человеческие названия rcode: без них в логе не отличить NXDOMAIN от SERVFAIL. */
 const RCODE名称表 = {
@@ -110,6 +30,14 @@ export const DoH记录类型映射 = { A: 1, NS: 2, CNAME: 5, MX: 15, TXT: 16, A
 // соединение без ответа бессмысленно — вся попытка дозвона и так ограничена
 // секундой на кандидата. Значение экспортируется, чтобы тест пиновал вилку.
 export const DoH超时毫秒 = 1200;
+// P2.4 (фикс 5): кэш СБОЕВ DoH — отдельно от DoH缓存 (ответов). Сбой резолвера
+// (таймаут/обрыв/HTTP-ошибка/SERVFAIL/REFUSED/FORMERR/NOTIMP/NOTAUTH) — это не
+// «домена нет»: он проходит сам, и повторный запрос в ближайшие секунды только
+// умножает латентность. TTL короткий (вилка 5–10 с), чтобы временная ошибка не
+// консервировала «нет данных»; NXDOMAIN по-прежнему живёт в DoH缓存 со своим
+// отрицательным TTL. Экспортируется, чтобы тесты чистили между прогонами.
+export const DoH失败缓存 = {};
+export const DoH失败缓存TTL = 5000;
 // P1.1: single-flight по «домен:тип». Два конкурентных дозвона на один и тот же
 // proxyip (параллельные кандидаты, повторные соединения, AAAA-хвост вместе с
 // TXT/A) раньше оба промахивались в кэш — он пишется только после ответа — и
@@ -117,6 +45,10 @@ export const DoH超时毫秒 = 1200;
 // результат; ключ тот же, что у кэша. Это «кэш для ещё не завершившегося
 // запроса»: после ответа запись удаляется, дальше работает DoH缓存.
 export const DoH进行中 = {};
+
+function 写入失败缓存(缓存键) {
+	DoH失败缓存[缓存键] = { 过期时间: Date.now() + DoH失败缓存TTL };
+}
 
 export async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query", 超时毫秒 = DoH超时毫秒) {
 	const 规范化域名 = String(域名 || '').trim().toLowerCase().replace(/\.$/, '');
@@ -128,6 +60,14 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 	if (现缓存项 && 当前时间戳 < 现缓存项.过期时间) {
 		log.调试(`[DoH查询] 命中缓存 ${域名} ${记录类型} via ${DoH解析服务}`);
 		return 现缓存项.data.map(data => ({ type: qtype, data }));
+	}
+	// P2.4 (фикс 5): сбой в окне 5 с не бьёт в сеть повторно. Первый сбой
+	// залогирован на уровне 错误 («DoH查询失败»), а тёплый кэш-сбой возвращает
+	// пусто быстро — потребители держат тот же фолбэк, что и при NXDOMAIN.
+	const 现失败项 = DoH失败缓存[缓存键];
+	if (现失败项 && 当前时间戳 < 现失败项.过期时间) {
+		log.调试(`[DoH查询] 命中 кэш сбоя ${域名} ${记录类型} via ${DoH解析服务}`);
+		return [];
 	}
 	// P1.1: пока первый запрос в полёте, все совпадающие домен:тип ждут его же.
 	// Проверка после кэша: завершённый запрос уже в DoH缓存, сюда не попадёт.
@@ -175,8 +115,12 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 				signal: 控制器.signal,
 			});
 			if (!response.ok) {
-				log.调试(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
-				return [];
+				// P2.4 (фикс 5): HTTP-ошибка — сбой, а не «пусто». Раньше здесь
+				// был log.调试 + return [] — от NXDOMAIN не отличалось, и резолвер,
+				// который отдаёт 5xx, выглядел как «домена нет».
+				log.错误(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
+				写入失败缓存(缓存键);
+				throw new Error(`DoH查询失败: ${域名} ${记录类型} HTTP ${response.status} via ${DoH解析服务}`);
 			}
 			const buf = new Uint8Array(await response.arrayBuffer());
 			const dv = new DataView(buf.buffer);
@@ -187,6 +131,16 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 			// «NXDOMAIN»: обе попадали в кэш на 5 минут.
 			const rcode = dv.getUint16(2) & 0x0f;
 			log.调试(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, rcode=${rcode}(${RCODE名称(rcode)}), ${ancount}条应答)`);
+			// P2.4 (фикс 5): ошибки резолвера — сбой, а не «пусто». SERVFAIL,
+			// REFUSED, FORMERR, NOTIMP, NOTAUTH говорят о беде самого резолвера:
+			// это не «домена нет», повтор в ближайшие секунды не поможет. Раньше
+			// они возвращались как [] (P1.8 их просто не кэшировал) — от NXDOMAIN
+			// в логах не отличались, и клиент видел «домена нет» при живом домене.
+			// Теперь: исключение DoH查询失败 + короткий кэш сбоя (5–10 с).
+			if (rcode !== 0 && rcode !== 3) {
+				写入失败缓存(缓存键);
+				throw new Error(`DoH查询失败: ${域名} ${记录类型} rcode=${rcode}(${RCODE名称(rcode)}) via ${DoH解析服务}`);
+			}
 			const 解析域名 = (pos) => {
 				const labels = [];
 				let p = pos, jumped = false, endPos = -1, safe = 128;
@@ -275,8 +229,14 @@ export async function DoH查询(域名, 记录类型, DoH解析服务 = "https:/
 			return answers;
 		} catch (error) {
 			const 耗时 = (performance.now() - 开始时间).toFixed(2);
-			log.调试(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
-			return [];
+			// P2.4 (фикс 5): таймаут/обрыв/сеть — сбой, а не «пусто». Раньше —
+			// return [] на уровне 调试: резолвер мог лежать часами, а по логам это
+			// выглядело как NXDOMAIN. Теперь сбой кэшируется на 5 с и падает
+			// исключением; потребители различают его по DoH查询失败.
+			log.错误(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
+			写入失败缓存(缓存键);
+			const 原由 = error instanceof Error ? error.message : String(error);
+			throw new Error(`DoH查询失败: ${域名} ${记录类型} via ${DoH解析服务} (${原由})`);
 		} finally {
 			clearTimeout(定时器);
 		}
@@ -335,10 +295,14 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 		}).map(prefix => 解析地址端口字符串(prefix));
 	}
 	const 反代IP数组 = await 整理成数组(proxyIP);
-	let 所有反代数组 = [];
 	const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
 	const ipv6Regex = /^\[?(?:[a-fA-F0-9]{0,4}:){1,7}[a-fA-F0-9]{0,4}\]?$/;
-	for (const singleProxyIP of 反代IP数组) {
+	// P2.4 (фикс 4): домены резолвятся ПАРАЛЛЕЛЬНО, а не по очереди. Раньше
+	// длинный список PROXYIP стоял клиенту последовательно: каждый домен — до
+	// 3 × DoH (TXT+A+AAAA) с таймаутом 1.2с, пока не соберётся результат.
+	// Теперь все домены идут разом (single-flight P1.1 дублей не даёт), а
+	// порядок кандидатов восстанавливает HRW-сортировка ниже (вес + адрес).
+	const 各域名结果 = await Promise.all(反代IP数组.map(async (singleProxyIP) => {
 		let [地址, 端口] = 解析地址端口字符串(singleProxyIP);
 		if (singleProxyIP.includes('.tp')) {
 			const tpMatch = singleProxyIP.match(/\.tp(\d+)/);
@@ -346,8 +310,7 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 		}
 		if (ipv4Regex.test(地址) || ipv6Regex.test(地址)) {
 			log.调试(`[反代解析] ${地址} 为IP地址，直接使用`);
-			所有反代数组.push([地址, 端口]);
-			continue;
+			return [[地址, 端口]];
 		}
 		// P1.1: AAAA-запрос идёт ПАРАЛЛЕЛЬНО с TXT и A, а не после их пустоты.
 		// Раньше третий DNS-запрос стартовал только когда TXT и A оба пустые:
@@ -355,29 +318,38 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 		// разрешении. Три запроса начинаются разом, третьим типом пользуемся по
 		// необходимости — попытка дозвона от этого не тормозится, single-flight
 		// (P1.1) дублей не даёт.
-		const [txtRecords, aRecords, aaaaRecords] = await Promise.all([DoH查询(地址, 'TXT'), DoH查询(地址, 'A'), DoH查询(地址, 'AAAA')]);
-		const txtData = txtRecords.filter(r => r.type === 16).map(r => (r.data));
-		const txtAddresses = 解析TXT反代记录(txtData);
-		if (txtAddresses.length > 0) {
-			log.调试(`[反代解析] ${地址} 使用TXT记录，共${txtAddresses.length}个结果`);
-			所有反代数组.push(...txtAddresses);
-			continue;
-		}
-		const ipv4List = aRecords.filter(r => r.type === 1).map(r => r.data);
-		if (ipv4List.length > 0) {
-			log.调试(`[反代解析] ${地址} 未获取到TXT记录，使用A记录，共${ipv4List.length}个结果`);
-			所有反代数组.push(...ipv4List.map(ip => [ip, 端口]));
-			continue;
-		}
-		const ipv6List = aaaaRecords.filter(r => r.type === 28).map(r => `[${r.data}]`);
-		if (ipv6List.length > 0) {
-			log.调试(`[反代解析] ${地址} 未获取到TXT和A记录，使用AAAA记录，共${ipv6List.length}个结果`);
-			所有反代数组.push(...ipv6List.map(ip => [ip, 端口]));
-		} else {
+		try {
+			const [txtRecords, aRecords, aaaaRecords] = await Promise.all([DoH查询(地址, 'TXT'), DoH查询(地址, 'A'), DoH查询(地址, 'AAAA')]);
+			const txtData = txtRecords.filter(r => r.type === 16).map(r => (r.data));
+			const txtAddresses = 解析TXT反代记录(txtData);
+			if (txtAddresses.length > 0) {
+				log.调试(`[反代解析] ${地址} 使用TXT记录，共${txtAddresses.length}个结果`);
+				return txtAddresses;
+			}
+			const ipv4List = aRecords.filter(r => r.type === 1).map(r => r.data);
+			if (ipv4List.length > 0) {
+				log.调试(`[反代解析] ${地址} 未获取到TXT记录，使用A记录，共${ipv4List.length}个结果`);
+				return ipv4List.map(ip => [ip, 端口]);
+			}
+			const ipv6List = aaaaRecords.filter(r => r.type === 28).map(r => `[${r.data}]`);
+			if (ipv6List.length > 0) {
+				log.调试(`[反代解析] ${地址} 未获取到TXT和A记录，使用AAAA记录，共${ipv6List.length}个结果`);
+				return ipv6List.map(ip => [ip, 端口]);
+			}
 			log.调试(`[反代解析] ${地址} 未获取到TXT、A和AAAA记录，保留原域名`);
-			所有反代数组.push([地址, 端口]);
+			return [[地址, 端口]];
+		} catch (error) {
+			// P2.4 (фикс 5): сбой резолвера ≠ «пусто». Раньше DoH возвращал [] и
+			// на таймаут, и на NXDOMAIN — обе ветки молча сводились к этой строке.
+			// Теперь сбой падает сюда с исключением DoH查询失败: логируем отдельно
+			// (видно в [反代解析], что именно резолвер лежал), а домен оставляем
+			// кандидатом — платформа при дозвоне резолвит его сама. Короткий кэш
+			// сбоя (5–10 с) не даст молотить резолвер на каждое соединение.
+			log.错误(`[反代解析] ${地址} 解析失败（резолвер недоступен）: ${error?.message || error}`);
+			return [[地址, 端口]];
 		}
-	}
+	}));
+	const 所有反代数组 = 各域名结果.flat();
 	const 目标根域名 = 目标域名.includes('.') ? 目标域名.split('.').slice(-2).join('.') : 目标域名;
 	// P1.3: HRW (rendezvous hashing) вместо seed-перемешивания. Перемешивание
 	// Фишера–Йетса (введённое в P4.6 против смещённого sort() со случайным
@@ -394,19 +366,4 @@ export async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflar
 	return 解析结果;
 }
 
-export function parseTurnErrorCode(data) {
-	return data?.byteLength >= 4 ? (data[2] & 7) * 100 + data[3] : 0;
-}
 
-export function randomTurnTransactionId() {
-	return crypto.getRandomValues(new Uint8Array(12));
-}
-
-export async function addTurnMessageIntegrity(message, key) {
-	const signedMessage = new Uint8Array(message);
-	const view = new DataView(signedMessage.buffer);
-	view.setUint16(2, view.getUint16(2) + 24);
-	const hmacKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-	const signature = await crypto.subtle.sign('HMAC', hmacKey, signedMessage);
-	return 拼接字节数据(signedMessage, createTurnStunAttribute(TURN_STUN_ATTR.MESSAGE_INTEGRITY, new Uint8Array(signature)));
-}
