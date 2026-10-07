@@ -14,7 +14,7 @@
 
 import { 有效数据长度, 数据转Uint8Array, isIPHostname, isIPv4 } from "../util";
 import { DoH查询, 解析地址端口 } from "../dns";
-import { 创建请求TCP连接器, 连接木马反代, 提取木马反代握手数据, socks5Connect, httpConnect, httpsConnect, turnConnect, sstpConnect } from "../upstream/dial";
+import { 创建请求TCP连接器, 连接木马反代, 提取木马反代握手数据, socks5Connect, httpConnect, turnConnect, sstpConnect } from "../upstream/dial";
 import { 创建Grain收纳器, 下行Grain包字节, 下行Grain尾部阈值, 下行Grain低水位字节, 下行Grain最大等待轮次 } from "./grain";
 import { 取SOCKS5白名单 } from "../config";
 import { 创建日志器, 安全错误 } from "../logging";
@@ -426,9 +426,9 @@ export async function forwardataTCP({
 					newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接, ctx代理参数);
 				} else if (ctx代理类型 === 'https') {
 					log.调试(`[HTTPS代理] 代理到: ${host}:${portNum}`);
-					newSocket = isIPHostname(ctx代理参数.hostname)
-						? await httpsConnect(host, portNum, 本次首包数据, TCP连接, ctx代理参数)
-						: await httpConnect(host, portNum, 本次首包数据, true, TCP连接, ctx代理参数);
+					// P2/P19: кастомный TLS удалён. И для IP-, и для доменных хостов —
+					// runtime `secureTransport:'on'` (httpConnect с HTTPS代理=true).
+					newSocket = await httpConnect(host, portNum, 本次首包数据, true, TCP连接, ctx代理参数);
 				} else if (ctx代理类型 === 'turn') {
 					log.调试(`[TURN代理] 代理到: ${host}:${portNum}`);
 					newSocket = await turnConnect(ctx代理参数, host, portNum, TCP连接);

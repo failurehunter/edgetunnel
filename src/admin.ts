@@ -14,7 +14,7 @@
 //     не блокируя миграцию, но зафиксировав в issue-трекере. Здесь переносится
 //     без изменений.
 
-import { MD5MD5, isIPHostname, 拼接字节数据 } from "./util";
+import { MD5MD5, 拼接字节数据 } from "./util";
 import { 读取config_JSON, getCloudflareUsage, 获取传输协议配置 } from "./config";
 import { 识别运营商, 请求优选API, 生成随机IP } from "./subscription";
 import { 请求日志记录 } from "./telemetry";
@@ -24,11 +24,9 @@ import {
 	创建请求TCP连接器,
 	socks5Connect,
 	httpConnect,
-	httpsConnect,
 	turnConnect,
 	sstpConnect,
 } from "./upstream/dial";
-import { TlsClient } from "./tls";
 import { 创建日志器 } from "./logging";
 const log = 创建日志器('admin');
 
@@ -72,28 +70,39 @@ try {
 	const { username, password, hostname, port } = checkParsed;
 	const 完整代理参数 = username && password ? `${username}:${password}@${hostname}:${port}` : `${hostname}:${port}`;
 	try {
-		const 检测主机 = 'cloudflare.com', 检测端口 = 443, encoder = new TextEncoder(), decoder = new TextDecoder();
+		const 检测主机 = 'cloudflare.com', encoder = new TextEncoder(), decoder = new TextDecoder();
 		const TCP连接 = 创建请求TCP连接器(request);
-		let tcpSocket = null, tlsSocket = null;
+		// P2/P19: кастомный TLS (src/tls.ts) удалён полностью.
+		//  * socks5/http/https — туннель до cloudflare.com:443, TLS к цели поднимает
+		//    runtime (`startTls`). Сертификаты воркер не проверяет (как раньше
+		//    `insecure: true`) — это диагностика доступности, не шифрование данных.
+		//  * turn/sstp — их канал данных не является Socket (перефрейминг в STUN/
+		//    SSTP), поэтому native startTls там невозможен; проверка идёт через
+		//    plaintext :80 — /cdn-cgi/trace отдаётся и по HTTP.
+		const 检测端口 = (代理协议 === 'turn' || 代理协议 === 'sstp') ? 80 : 443;
+		let 检查socket = null;
 		try {
-			tcpSocket = 代理协议 === 'socks5'
+			检查socket = 代理协议 === 'socks5'
 				? await socks5Connect(检测主机, 检测端口, new Uint8Array(0), TCP连接, checkParsed)
 				: 代理协议 === 'turn'
 					? await turnConnect(checkParsed, 检测主机, 检测端口, TCP连接)
 					: 代理协议 === 'sstp'
 						? await sstpConnect(checkParsed, 检测主机, 检测端口, TCP连接)
-						: (代理协议 === 'https' && isIPHostname(hostname)
-							? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接, checkParsed)
-							: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, checkParsed));
-			if (!tcpSocket) throw new Error('无法连接到代理服务器');
-			tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
-			await tlsSocket.handshake();
-			await tlsSocket.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`));
+						: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, checkParsed);
+			if (!检查socket) throw new Error('无法连接到代理服务器');
+			if (代理协议 !== 'turn' && 代理协议 !== 'sstp') {
+				if (typeof 检查socket.startTls !== 'function') throw new Error('代理检测: туннельный сокет не поддерживает native startTls');
+				检查socket = 检查socket.startTls({ expectedServerHostname: 检测主机 });
+			}
+			const writer = 检查socket.writable.getWriter();
+			const reader = 检查socket.readable.getReader();
+			await writer.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`));
+			writer.releaseLock();
 			let responseBuffer = new Uint8Array(0), headerEndIndex = -1, contentLength = null, chunked = false;
 			const 最大响应字节 = 64 * 1024;
 			while (responseBuffer.length < 最大响应字节) {
-				const value = await tlsSocket.read();
-				if (!value) break;
+				const { done, value } = await reader.read();
+				if (done || !value) break;
 				if (value.byteLength === 0) continue;
 				responseBuffer = 拼接字节数据(responseBuffer, value);
 				if (headerEndIndex === -1) {
@@ -114,13 +123,14 @@ try {
 				if (headerEndIndex !== -1 && chunked && decoder.decode(responseBuffer).includes('\r\n0\r\n\r\n')) break;
 			}
 			if (headerEndIndex === -1) throw new Error('代理检测响应头过长或无效');
+			reader.releaseLock();
 			const response = decoder.decode(responseBuffer);
 			const ip = response.match(/(?:^|\n)ip=(.*)/)?.[1];
 			const loc = response.match(/(?:^|\n)loc=(.*)/)?.[1];
 			if (!ip || !loc) throw new Error('代理检测响应无效');
 			检测代理响应 = { success: true, proxy: 代理协议 + "://" + 完整代理参数, ip, loc, responseTime: Date.now() - startTime };
 		} finally {
-			try { tlsSocket ? tlsSocket.close() : await tcpSocket?.close?.() } catch (e) { }
+			try { await 检查socket?.close?.() } catch (e) { }
 		}
 	} catch (error) {
 		检测代理响应 = { success: false, error: error.message, proxy: 代理协议 + "://" + 完整代理参数, responseTime: Date.now() - startTime };
