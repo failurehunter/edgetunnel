@@ -21,14 +21,24 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 // Шаг 1.1 (реестр 1.1, строка 1): настройки запроса собираются чистой функцией.
 // cmcc-пин старой строки 43 удалён — оператор больше не урезает 并发拨号 до 1.
 // Ни одно request-зависимое значение не пишется в module-scope во время обслуживания.
+// P17: верхняя граница параллельных dial/反代 — раньше Math.max(1, Number(env)||дфл)
+// не имел потолка: TCP_CONCURRENT_DIAL=Infinity давал Infinity, который в relay.ts
+// уходил в Array.from({length:Infinity}) → RangeError, а «99999» — тысячи
+// конкурентных соединений на запрос. 0/NaN/нечитаемое → дефолт (как раньше),
+// отрицательные/дробные и нефинитные → вилка [1, 上限].
+export function 钳制并发数(значение, 默认, 上限) {
+	const n = Number(значение) || 默认;
+	return Math.min(Math.max(1, Math.round(n)), 上限);
+}
+
 export function parseSettings(env, request) {
 	return {
 		// P1.10: все dial-настройки читаются отсюда, на каждый запрос заново.
 		// Раньше 预加载竞速拨号 и 反代并发拨号数 жили в модуле relay и накапливались
 		// между запросами: включённый флаг уже нельзя было выключить, число —
 		// заменить. Значения по умолчанию — те же, что были в модуле.
-		dialConcurrency: Math.max(1, Number(env?.TCP_CONCURRENT_DIAL) || 2),
-		proxyConcurrency: Math.max(1, Number(env?.PROXY_CONCURRENT_DIAL) || 1),
+		dialConcurrency: 钳制并发数(env?.TCP_CONCURRENT_DIAL, 2, 8),
+		proxyConcurrency: 钳制并发数(env?.PROXY_CONCURRENT_DIAL, 1, 4),
 		preloadRace: ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL)),
 		// P1.10: 白名单 — тоже. Раньше 应用白名单环境 дописывала в модульный
 		// массив, и отозванное правило не исчезало никогда.
