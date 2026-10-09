@@ -11,7 +11,7 @@ const log = 创建日志器('xhttp');
 import { 获取叉HTTPPadding标识 } from "../config";
 import { 增量解析木马首包, 增量解析魏烈思首包, 魏烈思文本解码器 } from "../protocols";
 import { 有效数据长度 } from "../util";
-import { 创建上行Grain合包流 } from "./grain";
+import { 创建上行Grain合包流, 下行队列最大字节, 下行队列最大条目 } from "./grain";
 import { closeSocketQuietly, forwardataTCP, 失效TCP连接世代 } from "./relay";
 import { forwardataudp, isSpeedTestSite, 构造本地204响应, 转发木马UDP数据 } from "./shared";
 import { 创建Upstream会话 } from "./upstream-session";
@@ -180,7 +180,10 @@ export async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {
 				try { 上行reader.releaseLock() } catch (e) { }
 			}
 		} finally {
-			try { await 上行合包器.结束() } catch (e) { }
+			// P11: ошибка 结束() не глотается — доезжает до 上行Promise.catch(清理),
+			// который рвёт соединение. Раньше catch(() => { }) здесь (и catch в
+			// 排队冲刷) молча съедал упавший флаш вместе с байтами буфера.
+			await 上行合包器.结束();
 		}
 		await 搬运Promise;
 	})();
@@ -220,19 +223,93 @@ export function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文,
 		async start(controller) {
 			let 已关闭 = false;
 			let udpRespHeader = 首包.respHeader;
+			// P5: зеркало P4 (gRPC): bounded даунлинк-буфер. Раньше send() звал
+			// controller.enqueue() напрямую — не читающий клиент раздувал
+			// внутреннюю очередь контроллера без границ. Лимит из
+			// 反代上下文.下行队列限额 (тест даёт крошечный), по умолчанию —
+			// зеркальные потолки апстрим-очереди.
+			const 下行限额 = {
+				字节: 反代上下文?.下行队列限额?.字节 || 下行队列最大字节,
+				条目: 反代上下文?.下行队列限额?.条目 || 下行队列最大条目,
+			};
+			let 叉桥队列 = [];
+			let 叉桥队列字节数 = 0;
+			let 叉桥刷新定时器 = null;
+			let 叉桥刷新Microtask已排队 = false;
+			const 叉桥刷新 = (force = false) => {
+				叉桥刷新Microtask已排队 = false;
+				if (叉桥刷新定时器) {
+					clearTimeout(叉桥刷新定时器);
+					叉桥刷新定时器 = null;
+				}
+				if ((!force && 已关闭) || 叉桥队列字节数 === 0) return;
+				// P5: клиент не читает (desiredSize <= 0) — не растем в ядре
+				// контроллера, данные держим в своей (лимитированной) очереди.
+				if (!force && typeof controller.desiredSize === 'number' && controller.desiredSize <= 0) return;
+				const blob = 叉桥队列字节数 === 1 ? 叉桥队列[0] : (() => {
+					const out = new Uint8Array(叉桥队列字节数);
+					let o = 0;
+					for (const item of 叉桥队列) { out.set(item, o); o += item.byteLength; }
+					return out;
+				})();
+				叉桥队列 = [];
+				叉桥队列字节数 = 0;
+				try { controller.enqueue(blob); } catch (e) {
+					已关闭 = true;
+					叉桥.readyState = WebSocket.CLOSED;
+				}
+			};
+			const 叉桥安排刷新 = () => {
+				if (已关闭 || 叉桥队列字节数 === 0) return;
+				if (叉桥刷新Microtask已排队 || 叉桥刷新定时器) return;
+				叉桥刷新Microtask已排队 = true;
+				queueMicrotask(() => {
+					叉桥刷新Microtask已排队 = false;
+					if (已关闭 || 叉桥队列字节数 === 0 || 叉桥刷新定时器) return;
+					叉桥刷新定时器 = setTimeout(() => {
+						叉桥刷新定时器 = null;
+						叉桥刷新();
+						// P5: флаш отложен из-за backpressure — держим тикер,
+						// пока есть неотправленное.
+						if (!已关闭 && 叉桥队列字节数 > 0) 叉桥安排刷新();
+					}, 1);
+				});
+			};
+			// P5: не читающий клиент упёрся в потолок — сессия обрывается,
+			// память не копится. Апстрим-сокет рвём тоже (cancel-пропагация).
+			const 叉桥溢出关闭 = () => {
+				if (已关闭) return;
+				log.错误(`[叉HTTP-UDP] 下行缓冲超限 ${叉桥队列字节数}B/${叉桥队列.length}条 — клиент не читает, обрыв`);
+				已关闭 = true;
+				叉桥.readyState = WebSocket.CLOSED;
+				// Доставить хвост в пределах лимита (flush по тикеру мог не успеть:
+				// шторм ответов укладывается в первые мс, быстрее тикера), затем обрыв.
+				叉桥刷新(true);
+				try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
+				try { controller.close() } catch (e) { }
+			};
 			const 叉桥 = {
 				readyState: WebSocket.OPEN,
 				send(data) {
 					if (已关闭) return;
+					let chunk;
 					try {
-						const chunk = data instanceof Uint8Array
+						chunk = data instanceof Uint8Array
 							? data
 							: data instanceof ArrayBuffer
 								? new Uint8Array(data)
 								: ArrayBuffer.isView(data)
 									? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
 									: new Uint8Array(data);
-						controller.enqueue(chunk);
+						叉桥队列.push(chunk);
+						叉桥队列字节数 += chunk.byteLength;
+						// P5: жёсткий предел — как в gRPC (P4): не читающий клиент
+						// не копит память изолята.
+						if (叉桥队列字节数 > 下行限额.字节 || 叉桥队列.length > 下行限额.条目) {
+							叉桥溢出关闭();
+							return;
+						}
+						叉桥安排刷新();
 					} catch (e) {
 						已关闭 = true;
 						this.readyState = WebSocket.CLOSED;
@@ -240,6 +317,7 @@ export function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文,
 				},
 				close() {
 					if (已关闭) return;
+					叉桥刷新(true);
 					已关闭 = true;
 					this.readyState = WebSocket.CLOSED;
 					try { controller.close() } catch (e) { }

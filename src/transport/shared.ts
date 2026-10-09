@@ -151,25 +151,24 @@ export async function forwardataudp(udpChunk, webSocket, respHeader, request, �
 		// сессии. Условие завершения известно точно — двухбайтная длина ответа.
 		const 读取器 = tcpSocket.readable.getReader();
 		let накоплено = new Uint8Array(0);
+		// P18: ровно один долгоживущий read(), без гонки с таймером. Раньше гонка
+		// read() c 250мс-таймером оставляла проигравший read() висеть, а следующий
+		// read() на том же reader — конкурентное чтение (по спеке повторный read
+		// при незавершённом бросает TypeError). Таймаут будит pending read через
+		// cancel(причина): reader всегда в одном состоянии, лишних висящих read()
+		// на каждой тишине не остаётся (P1.9: и таймеров опроса тоже — отменяет
+		// ровно тот, что ждём).
+		const 取消读取 = () => { try { 读取器.cancel(中止.reason) } catch (e) { } };
+		中止.signal.addEventListener('abort', 取消读取, { once: true });
 		while (true) {
 			if (中止.signal.aborted) break;
-			// P1.9: таймер опроса снимается сразу после гонки. Раньше он жил
-			// 250 мс после каждого чтения, в том числе после выхода по таймауту
-			// или по полному ответу — то есть на каждой итерации оставался живой
-			// таймер, а на прерванной сессии их копились десятки.
-			let 定时器 = null;
 			let поступило;
 			try {
-				поступило = await Promise.race([
-					读取器.read(),
-					new Promise((res) => { 定时器 = setTimeout(() => res({ value: null, done: false }), 250); }),
-				]);
-			} finally {
-				if (定时器) clearTimeout(定时器);
-			}
-			if (поступило.value === null) {
-				// Тишина в потоке: проверяем таймаут и ждём дальше.
-				continue;
+				поступило = await 读取器.read();
+			} catch (err) {
+				// cancel() по таймауту селит pending read — штатный выход, не поломка.
+				if (中止.signal.aborted) break;
+				throw err;
 			}
 			if (поступило.done) break;
 			const кусок = 数据转Uint8Array(поступило.value);

@@ -9,7 +9,7 @@
 const log = 创建日志器('grpc');
 import { 判断首包协议, 增量解析木马首包, 增量解析魏烈思首包, 累积首包 } from "../protocols";
 import { 有效数据长度 } from "../util";
-import { 下行Grain包字节 } from "./grain";
+import { 下行Grain包字节, 下行队列最大字节, 下行队列最大条目 } from "./grain";
 import { forwardataTCP, 失效TCP连接世代 } from "./relay";
 import { forwardataudp, isSpeedTestSite, 构造本地204响应, 转发木马UDP数据 } from "./shared";
 import { 创建Upstream会话 } from "./upstream-session";
@@ -124,6 +124,12 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 
 	const 下行缓存上限 = 下行Grain包字节;
 	const 下行刷新间隔 = 1;
+	// P4: потолок даунлинк-буфера. Тест может задать крошечный лимит через
+	// 反代上下文.下行队列限额, чтобы проверить overflow без 16МиБ трафика.
+	const 下行限额 = {
+		字节: 反代上下文?.下行队列限额?.字节 || 下行队列最大字节,
+		条目: 反代上下文?.下行队列限额?.条目 || 下行队列最大条目,
+	};
 
 	return new Response(new ReadableStream({
 		async start(controller) {
@@ -150,6 +156,11 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 					frame.set(chunk, 6 + lenBytes.length);
 					发送队列.push(frame);
 					队列字节数 += frame.byteLength;
+					// P4: жёсткий предел — не читающий клиент не копит память изолята.
+					if (队列字节数 > 下行限额.字节 || 发送队列.length > 下行限额.条目) {
+						溢出关闭();
+						return;
+					}
 					安排刷新发送队列();
 				},
 				close() {
@@ -168,6 +179,11 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 					刷新定时器 = null;
 				}
 				if ((!force && 已关闭) || 队列字节数 === 0) return;
+				// P4: клиент не читает (desiredSize <= 0) — не растем в ядре
+				// контроллера: данные копятся в НАШЕЙ очереди, тикер ниже шлёт их,
+				// когда желание читать вернётся. Форс-флаш при закрытии доставляет
+				// хвост, даже если клиент в этот момент не читает.
+				if (!force && typeof controller.desiredSize === 'number' && controller.desiredSize <= 0) return;
 				const out = new Uint8Array(队列字节数);
 				let offset = 0;
 				for (const item of 发送队列) {
@@ -185,8 +201,18 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 			};
 
 			const 安排刷新发送队列 = () => {
+				if (已关闭) return;
 				if (队列字节数 >= 下行缓存上限) {
 					刷新发送队列();
+					// P4: большой хвост может ждать читателя — не теряем его:
+					// тикер продолжает жить, пока очередь не опустеет.
+					if (!已关闭 && 队列字节数 > 0 && !刷新定时器) {
+						刷新定时器 = setTimeout(() => {
+							刷新定时器 = null;
+							刷新发送队列();
+							if (!已关闭 && 队列字节数 > 0) 安排刷新发送队列();
+						}, 下行刷新间隔);
+					}
 					return;
 				}
 				if (刷新Microtask已排队 || 刷新定时器) return;
@@ -194,8 +220,25 @@ export async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, 
 				queueMicrotask(() => {
 					刷新Microtask已排队 = false;
 					if (已关闭 || 队列字节数 === 0 || 刷新定时器) return;
-					刷新定时器 = setTimeout(刷新发送队列, 下行刷新间隔);
+					刷新定时器 = setTimeout(() => {
+						刷新定时器 = null;
+						刷新发送队列();
+						// P4: флаш отложен из-за backpressure (desired <= 0) —
+						// держим тикер, пока есть неотправленное.
+						if (!已关闭 && 队列字节数 > 0) 安排刷新发送队列();
+					}, 下行刷新间隔);
 				});
+			};
+
+			// P4: не читающий клиент упёрся в потолок — сессия обрывается,
+			// а не держит память. Ошибка видна в логе, апстрим рвётся 关闭连接.
+			const 溢出关闭 = () => {
+				if (已关闭) return;
+				log.错误(`[gRPC] 下行缓冲超限 ${队列字节数}B/${发送队列.length}条 — клиент не читает, обрыв`);
+				// 关闭连接 сама флашит хвост (force), ставит 已关闭 и закрывает
+				// стрим. НЕ ставить 已关闭 заранее: иначе первый же if (已关闭)
+				// в 关闭连接 вернул бы её досрочно, и хвост со стримом пропали.
+				关闭连接();
 			};
 
 			const 关闭连接 = () => {
